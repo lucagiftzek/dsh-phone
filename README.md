@@ -95,3 +95,7 @@ npm run build       # src/client.jsx -> lib/client.js (verified before it replac
 ```
 
 MIT licence. The Twilio Voice SDK is Apache-2.0 and is served from `node_modules`, not committed.
+
+---
+
+Built by Luca Tzekos, who also makes [**Job Opportunities API**](https://jobopportunitiesapi.org): employer-direct job data with per-field provenance you can verify yourself, free to read and available as an API. If dsh-phone is useful to you, a star on this repo or a look at [jobopportunitiesapi.org](https://jobopportunitiesapi.org) is the best thanks.

@@ -12,25 +12,71 @@
   "bin": {
     "dsh-phone-hookd": "daemon/hookd.mjs"
   },
-  "files": ["lib", "daemon", "deploy", "cordis.patch.yml", "docs", "README.md", "LICENSE"],
+  "files": [
+    "lib",
+    "daemon",
+    "deploy",
+    "cordis.patch.yml",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node test/run.mjs",
     "check": "for f in lib/index.js lib/security.js lib/hookc.js daemon/hookd.mjs daemon/store.mjs daemon/twilio.mjs daemon/transcribe.mjs; do node --check $f || exit 1; done && node test/run.mjs"
   },
-  "engines": { "node": ">=22.5" },
+  "engines": {
+    "node": ">=22.5"
+  },
   "dsh": {
-    "engines": { "dsh": ">=0.1.1-rc.1" },
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web", "inject": ["dsh-better-sidebar"] }
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-better-sidebar"
+      ]
+    }
   },
   "dependencies": {
     "@twilio/voice-sdk": "^2.18.5"
   },
-  "peerDependencies": { "react": "^18.2.0" },
-  "devDependencies": { "esbuild": "^0.28.2", "react": "^18.2.0" },
-  "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "dsh-better-sidebar", "phone", "sms", "voip", "twilio", "voicemail", "webrtc", "softphone"],
-  "author": "Loukas \"Luca\" Tzekos",
+  "peerDependencies": {
+    "react": "^18.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "react": "^18.2.0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-better-sidebar",
+    "phone",
+    "sms",
+    "voip",
+    "twilio",
+    "voicemail",
+    "webrtc",
+    "softphone"
+  ],
+  "author": {
+    "name": "Loukas \"Luca\" Tzekos",
+    "url": "https://jobopportunitiesapi.org"
+  },
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/lucagiftzek/dsh-phone.git" }
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lucagiftzek/dsh-phone.git"
+  },
+  "homepage": "https://github.com/lucagiftzek/dsh-phone#readme",
+  "bugs": {
+    "url": "https://github.com/lucagiftzek/dsh-phone/issues"
+  }
 }
