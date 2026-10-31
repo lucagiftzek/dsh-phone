@@ -1,0 +1,9 @@
+# dsh-phone: mount the plugin (node half = exports ".", browser half = exports "./client").
+# Kill switch without uninstalling: add to ~/.dsh/profiles/web/cordis.patch.yml
+#   - id: dsh-phone
+#     disabled: true
+# or set DSH_PHONE_DISABLE=1 in the dsh-web environment. phone-hookd (the
+# webhook daemon) is a separate systemd unit and keeps answering calls.
+- insert:
+    - id: dsh-phone
+      name: 'dsh-phone'

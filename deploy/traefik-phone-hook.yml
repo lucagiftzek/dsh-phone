@@ -1,0 +1,18 @@
+# Traefik (file provider) example: route ONLY the webhook prefix to phone-hookd,
+# WITHOUT your login middleware. Everything else on the host stays behind it.
+http:
+  routers:
+    phone-hook:
+      rule: "Host(`llm.example.com`) && PathPrefix(`/phone-hook/`)"
+      priority: 5350          # above your catch-all / API routers
+      entryPoints: [web]
+      middlewares: [phone-hook-ratelimit]
+      service: phone-hook
+  middlewares:
+    phone-hook-ratelimit:
+      rateLimit: { average: 20, period: 1s, burst: 60 }
+  services:
+    phone-hook:
+      loadBalancer:
+        servers: [{ url: "http://127.0.0.1:3098" }]
+        passHostHeader: true

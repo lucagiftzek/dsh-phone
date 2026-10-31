@@ -1,0 +1,36 @@
+{
+  "name": "dsh-phone",
+  "version": "0.1.0",
+  "description": "Phone for the DeepSeek Harness web GUI: a sidebar tab to send and receive SMS, place and receive calls in the browser, Live / Voicemail / Do-not-disturb modes with iOS-style live voicemail (real-time transcript + pick up), local voicemail transcription, and phone_* agent tools. Twilio today, SIP lines next. Configured from DSH Settings.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-phone-hookd": "daemon/hookd.mjs"
+  },
+  "files": ["lib", "daemon", "deploy", "cordis.patch.yml", "docs", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node test/run.mjs",
+    "check": "for f in lib/index.js lib/security.js lib/hookc.js daemon/hookd.mjs daemon/store.mjs daemon/twilio.mjs daemon/transcribe.mjs; do node --check $f || exit 1; done && node test/run.mjs"
+  },
+  "engines": { "node": ">=22.5" },
+  "dsh": {
+    "engines": { "dsh": ">=0.1.1-rc.1" },
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "inject": ["dsh-better-sidebar"] }
+  },
+  "dependencies": {
+    "@twilio/voice-sdk": "^2.18.5"
+  },
+  "peerDependencies": { "react": "^18.2.0" },
+  "devDependencies": { "esbuild": "^0.28.2", "react": "^18.2.0" },
+  "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "dsh-better-sidebar", "phone", "sms", "voip", "twilio", "voicemail", "webrtc", "softphone"],
+  "author": "Loukas \"Luca\" Tzekos",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/lucagiftzek/dsh-phone.git" }
+}

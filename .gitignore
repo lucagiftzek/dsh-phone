@@ -1,0 +1,8 @@
+node_modules/
+*.tmp-*
+.env
+*.db
+*.db-*
+credentials
+provisioned.json
+hookd-config.json

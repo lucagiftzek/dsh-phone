@@ -1,0 +1,46 @@
+# /etc/systemd/system/dsh-phone-hookd.service  (template: replace YOUR_USER and the paths)
+# phone-hookd: provider webhooks (public, signature-checked, 127.0.0.1:3098)
+# and the private call/SMS API for the DSH plugin (unix socket ~/.dsh/phone/hookd.sock).
+# Runs outside dsh web on purpose: calls still reach voicemail while the web UI restarts.
+[Unit]
+Description=dsh-phone hookd: provider webhooks + call/SMS engine for the DSH Phone tab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+Environment=DSH_HOME=/home/YOUR_USER/.dsh
+Environment=NODE_NO_WARNINGS=1
+# Node 22.5 or newer (node:sqlite). With nvm, point at that node binary instead.
+ExecStart=/usr/bin/node /path/to/dsh-phone/daemon/hookd.mjs
+Restart=always
+RestartSec=3
+MemoryMax=512M
+UMask=0077
+# Hardening: read-only system and home, writable only its own data dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOUR_USER/.dsh/phone
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
