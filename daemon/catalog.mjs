@@ -251,6 +251,11 @@ export const CATALOG = {
     message: 'The media server include directory is missing or not writable',
     hint: 'Create the include directory, owned by the daemon user with the media server group, mode 0750 (see docs/RELAY.md).',
   },
+  PHONE_RELAY_DIR_FOREIGN: {
+    status: 409,
+    message: 'The media server include directory belongs to another dsh-phone instance',
+    hint: 'Its files carry another instance marker, so nothing was written. Give this instance its own relay include directory (relay.configDir), or remove the other instance first.',
+  },
   PHONE_RELAY_AMI_FAILED: {
     status: 500,
     message: 'The media server manager interface (AMI) rejected or did not answer',

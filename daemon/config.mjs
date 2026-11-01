@@ -98,7 +98,10 @@ export const DEFAULTS = {
   sipAccounts: [],
   relay: {
     enabled: true,
-    configDir: '/etc/asterisk/dsh-phone',
+    // Where the Asterisk include files go. Empty = <phone data dir>/asterisk, so every
+    // instance has its own; point it at the directory your Asterisk #includes
+    // (for example /etc/asterisk/dsh-phone) when you run the relay.
+    configDir: '',
     bindAddress: '',
     bindPort: 5070,
     loopback: true,

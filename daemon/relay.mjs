@@ -3,10 +3,16 @@
  *
  * phone-hookd owns the relay configuration: it renders the Asterisk include
  * files from Settings (daemon/sip.mjs), writes them into the include
- * directory (default /etc/asterisk/dsh-phone, owned by the hookd user with
- * group asterisk, setgid, mode 0750; files 0640) and reloads Asterisk over
- * the loopback-only AMI. Asterisk's own pjsip.conf / extensions.conf /
- * manager.conf only #include these files.
+ * directory (relay.configDir; empty = <phone data dir>/asterisk, so each
+ * instance has its own; a system relay uses e.g. /etc/asterisk/dsh-phone,
+ * owned by the hookd user with group asterisk, setgid, mode 0750; files 0640)
+ * and reloads Asterisk over the loopback-only AMI. Asterisk's own pjsip.conf /
+ * extensions.conf / manager.conf only #include these files.
+ *
+ * Safety: nothing is written unless the relay is enabled AND at least one SIP
+ * account is configured. Every file starts with an instance marker
+ * ("; dsh-phone-instance: <id>", id kept in relay.json); a directory whose
+ * files carry another instance's marker is never written.
  *
  * Secrets the relay needs:
  *   ~/.dsh/phone/relay.json (0600)   amiSecret, bridgeKey (generated here)
@@ -29,12 +35,29 @@ import { E } from './errors.mjs'
 export const RELAY_DEFAULTS = DEFAULTS.relay
 
 export function relayConfigDir(settings) {
-  return process.env.DSH_PHONE_ASTERISK_DIR || (settings.relay && settings.relay.configDir) || RELAY_DEFAULTS.configDir
+  return process.env.DSH_PHONE_ASTERISK_DIR || expandHome((settings.relay && settings.relay.configDir) || RELAY_DEFAULTS.configDir || '') || join(dataDir(), 'asterisk')
+}
+
+export const MARKER_PREFIX = '; dsh-phone-instance: '
+
+/** The instance id in a generated file's marker line, '' when the file has none (older builds). */
+export function fileInstance(text) {
+  const m = /^; dsh-phone-instance: ([A-Za-z0-9-]+)/m.exec(String(text || ''))
+  return m ? m[1] : ''
+}
+
+/** Prefix a generated file with this instance's marker. */
+export function withMarker(text, id) {
+  return MARKER_PREFIX + id + ' (this directory belongs to that phone-hookd; others refuse to write here)\n' + text
+}
+
+function stripMarker(text) {
+  return String(text || '').replace(/^; dsh-phone-instance: [^\n]*\n/, '')
 }
 
 export function relaySecretsPath() { return join(dataDir(), 'relay.json') }
 
-/** amiSecret + bridgeKey, created once (0600). */
+/** amiSecret + bridgeKey + instanceId, created once (0600). */
 export function relaySecrets() {
   const p = relaySecretsPath()
   let cur = {}
@@ -42,6 +65,7 @@ export function relaySecrets() {
   let changed = false
   if (!cur.amiSecret) { cur.amiSecret = randomBytes(24).toString('hex'); changed = true }
   if (!cur.bridgeKey) { cur.bridgeKey = randomBytes(24).toString('hex'); changed = true }
+  if (!cur.instanceId || !/^[A-Za-z0-9-]+$/.test(cur.instanceId)) { cur.instanceId = randomBytes(8).toString('hex'); changed = true }
   if (changed) writeJson0600(p, { ...cur, updatedAt: new Date().toISOString() })
   return cur
 }
@@ -89,8 +113,13 @@ export function lastRelaySync() { return lastSync }
 
 /**
  * Render + write + reload. Never throws: the result says what happened.
- * Does nothing (state 'off') when no SIP account is configured and the include
- * directory does not exist, so installs without a relay are untouched.
+ * Does nothing (state 'off') unless the relay is enabled AND at least one SIP
+ * account is configured, so installs without a relay never touch any
+ * directory (an existing /etc/asterisk/dsh-phone of another install included).
+ * Refuses (state 'error', PHONE_RELAY_DIR_FOREIGN) when a file in the include
+ * directory carries another instance's marker. Files of an older build (no
+ * marker) are adopted; when only the marker is new, the file is rewritten
+ * without an Asterisk reload.
  */
 export async function syncRelay(settings, { reload = true, log = () => {}, warn = () => {} } = {}) {
   const dir = relayConfigDir(settings)
@@ -98,31 +127,45 @@ export async function syncRelay(settings, { reload = true, log = () => {}, warn 
   const accounts = resolveAccounts(settings)
   const codes = [] // error code of each entry of result.errors, for the log only
   const result = { at: new Date().toISOString(), state: 'ok', dir, changed: [], errors: [], restartNeeded: lastSync.restartNeeded, reload: null }
-  if (!r.enabled || (!accounts.length && !fs.existsSync(dir))) {
-    lastSync = { ...result, state: 'off' }
+  if (!r.enabled || !accounts.length) {
+    lastSync = { ...result, state: 'off', reason: !r.enabled ? 'relay disabled' : 'no SIP accounts' }
     return lastSync
   }
   try {
+    // The per-instance default directory is ours to create; an explicit one (a system path) must be provisioned.
+    if (!process.env.DSH_PHONE_ASTERISK_DIR && !(settings.relay && settings.relay.configDir) && !RELAY_DEFAULTS.configDir) fs.mkdirSync(dir, { recursive: true, mode: 0o750 })
     const secrets = relaySecrets()
     const bridge = bridgeInfo(settings)
-    const files = buildRelayConfig({
+    const rendered = buildRelayConfig({
       relay: r, accounts, lines: settings.lines, bridge,
       keyHash: bridgeKeyHash(secrets.bridgeKey),
       ami: { user: r.amiUser, secret: secrets.amiSecret },
       defaultCountry: settings.defaultCountry,
     })
-    for (const [name, text] of Object.entries(files)) {
-      const file = join(dir, name)
+    const files = Object.entries(rendered).map(([name, text]) => {
       let old = null
-      try { old = fs.readFileSync(file, 'utf8') } catch {}
+      try { old = fs.readFileSync(join(dir, name), 'utf8') } catch {}
+      return { name, text: withMarker(text, secrets.instanceId), old }
+    })
+    const foreign = files.filter(x => x.old !== null && fileInstance(x.old) && fileInstance(x.old) !== secrets.instanceId)
+    if (foreign.length) {
+      codes.push('PHONE_RELAY_DIR_FOREIGN')
+      result.errors.push('include directory ' + dir + ' belongs to another dsh-phone instance (' + foreign.map(x => x.name).join(', ') + '): nothing written. Set relay.configDir to this instance\'s own directory.')
+      files.length = 0
+    }
+    for (const { name, text, old } of files) {
       if (old === text) continue
-      if (name === 'pjsip.conf' && old !== null && transportBlock(old) !== transportBlock(text)) result.restartNeeded = true
+      const file = join(dir, name)
+      const markerOnly = old !== null && stripMarker(old) === stripMarker(text)
+      if (name === 'pjsip.conf' && old !== null && !markerOnly && transportBlock(stripMarker(old)) !== transportBlock(stripMarker(text))) result.restartNeeded = true
       const tmp = join(dir, '.' + name + '.tmp-' + process.pid)
       fs.writeFileSync(tmp, text, { mode: 0o640 })
       fs.chmodSync(tmp, 0o640)
       fs.renameSync(tmp, file)
-      result.changed.push(name)
+      if (markerOnly) (result.marked = result.marked || []).push(name)
+      else result.changed.push(name)
     }
+    if (result.marked) log('relay config marked with this instance id (no content change, no reload): ' + result.marked.join(', ') + ' in ' + dir)
     if (result.changed.length) log('relay config written: ' + result.changed.join(', ') + ' in ' + dir)
     if (reload && result.changed.length) {
       const modules = []

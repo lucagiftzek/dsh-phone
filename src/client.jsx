@@ -517,6 +517,7 @@ const CSS = `
   --line1:var(--dsw-alias-border-l1,rgba(128,128,128,.18));--l1:var(--dsw-alias-bg-layer-1,transparent);
   --l2:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.07));--hov:var(--dsh-alias-interactive-bg-hover,rgba(128,128,128,.12));
   --bg:var(--dsw-alias-bg-base,var(--dsw-alias-bg-layer-1,#fff));
+  --on-brand:var(--dsw-alias-label-primary-foreground,#fff);
   --mono:var(--tz-font-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace)}
 .phx{display:flex;flex-direction:column;height:100%;min-height:0;overflow:hidden;font:inherit;font-size:13px;color:var(--ink)}
 .phx *,.phx-ov *{box-sizing:border-box}
@@ -525,7 +526,7 @@ const CSS = `
 .phx-btn{font:inherit;font-size:12px;padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;color:inherit;cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
 .phx-btn:hover:not(:disabled){background:var(--hov)}
 .phx-btn:disabled{opacity:.45;cursor:not-allowed}
-.phx-btn.p{border-color:transparent;background:var(--dsw-alias-button-primary-fill,var(--brand));color:#fff;font-weight:600}
+.phx-btn.p{border-color:transparent;background:var(--dsw-alias-button-primary-fill,var(--brand));color:var(--on-brand);font-weight:600}
 .phx-btn.ok{border-color:transparent;background:var(--ok);color:#fff;font-weight:600}
 .phx-btn.d{border-color:var(--bad);color:var(--bad)}
 .phx-btn.dd{border-color:transparent;background:var(--bad);color:#fff;font-weight:600}
@@ -539,8 +540,8 @@ const CSS = `
 .phx-nav{display:flex;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--line);flex:0 0 auto;overflow-x:auto}
 .phx-nav button{font:inherit;font-size:12px;padding:5px 8px 7px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink2);cursor:pointer;white-space:nowrap;display:flex;gap:5px;align-items:center}
 .phx-nav button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--brand);font-weight:650}
-.phx-badge{font-size:10px;line-height:15px;min-width:16px;padding:0 4px;border-radius:999px;background:var(--brand);color:#fff;font-weight:700;text-align:center}
-.phx-badge.bad{background:var(--bad)}
+.phx-badge{font-size:10px;line-height:15px;min-width:16px;padding:0 4px;border-radius:999px;background:var(--brand);color:var(--on-brand);font-weight:700;text-align:center}
+.phx-badge.bad{background:var(--bad);color:#fff}
 .phx-k{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3)}
 .phx-h{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--ink3);margin:16px 0 6px;display:flex;align-items:center;gap:8px}
 .phx-s{font-size:11px;color:var(--ink3)}
@@ -564,7 +565,7 @@ textarea.phx-in{resize:vertical;min-height:38px;line-height:1.45}
 .phx-msgs{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:6px}
 .phx-bub{max-width:82%;padding:7px 10px;border-radius:12px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word;border:1px solid var(--line1)}
 .phx-bub.in{align-self:flex-start;background:var(--l2)}
-.phx-bub.out{align-self:flex-end;background:var(--dsw-alias-button-primary-fill,var(--brand));color:#fff;border-color:transparent}
+.phx-bub.out{align-self:flex-end;background:var(--dsw-alias-button-primary-fill,var(--brand));color:var(--on-brand);border-color:transparent}
 .phx-bub.out.failed{background:transparent;color:var(--bad);border-color:var(--bad)}
 .phx-meta{font-size:10.5px;color:var(--ink3);margin:-2px 4px 4px}
 .phx-meta.out{align-self:flex-end}
@@ -1279,7 +1280,7 @@ function SipAccounts({ form, set, lines }) {
         <Field label="Local networks"><input className="phx-in phx-mono" placeholder="your LAN as CIDR" value={listText(relay.localNets)} onChange={e => setR('localNets', textList(e.target.value))} /></Field>
         <Field label="Twilio SIP edge" hint="Where the relay registers, e.g. dublin"><input className="phx-in phx-mono" value={(form.twilio && form.twilio.sipEdge) || ''} onChange={e => set('twilio.sipEdge', e.target.value)} /></Field>
         <Field label="Bridge transport" hint="TLS: port 5061 with SRTP, and router SIP ALG helpers cannot touch the call"><select className="phx-in" value={relay.bridgeTransport || 'udp'} onChange={e => setR('bridgeTransport', e.target.value)}><option value="tls">TLS + SRTP</option><option value="udp">UDP + RTP</option></select></Field>
-        <Field label="Include directory"><input className="phx-in phx-mono" value={relay.configDir || ''} onChange={e => setR('configDir', e.target.value)} /></Field>
+        <Field label="Include directory" hint="Where Asterisk includes the generated files. Empty: a private folder of this instance (phone data dir/asterisk)"><input className="phx-in phx-mono" placeholder="per instance" value={relay.configDir || ''} onChange={e => setR('configDir', e.target.value)} /></Field>
       </div>
     </>
   )

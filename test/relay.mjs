@@ -18,7 +18,8 @@ import {
   bridgeSipUri, sipHeaders, sipUser, destinationAllowed, dialString, outgoingCallerId, confValue, accountDid, TWILIO_SIP_SIGNALLING,
 } from '../daemon/sip.mjs'
 import { amiRun, amiReload, amiRegistrations, amiRegister } from '../daemon/ami.mjs'
-import { staleRegistrations } from '../daemon/relay.mjs'
+import { staleRegistrations, syncRelay, relayConfigDir, fileInstance } from '../daemon/relay.mjs'
+import { E } from '../daemon/errors.mjs'
 import { resolveSettings, redact, sanitisePatch, preserveUnknownKeys } from '../daemon/config.mjs'
 import { expectedSignature } from '../daemon/twilio.mjs'
 
@@ -279,6 +280,122 @@ await t('AMI: login, reload, list registrations, bad secret', async () => {
   assert.throws(() => { throw new Error('x') })
   await assert.rejects(amiRun({ ...opts }, [{ Action: 'Reload', Module: 'a\r\nAction: Command' }]), /line break/)
 })
+
+// ---------------------------------------------------------------- relay directory guard (syncRelay, no daemon)
+// An instance must never write into a relay include directory it does not own:
+// not without SIP accounts, not with the relay off, never over another instance's files.
+
+{
+  const saved = { data: process.env.DSH_PHONE_DATA, ast: process.env.DSH_PHONE_ASTERISK_DIR, ami: process.env.DSH_PHONE_AMI_PORT }
+  delete process.env.DSH_PHONE_ASTERISK_DIR
+  process.env.DSH_PHONE_AMI_PORT = String(ami.port)
+  const root = mkdtempSync(join(tmpdir(), 'dshp-guard-'))
+  const files = ['pjsip.conf', 'extensions.conf', 'manager.conf']
+  const snap = (d) => Object.fromEntries(files.map(f => [f, existsSync(join(d, f)) ? readFileSync(join(d, f), 'utf8') : null]))
+  const reloads = () => ami.seen.filter(b => b.Action === 'Reload').length
+  const instance = (name) => {
+    const d = join(root, name); mkdirSync(d)
+    writeFileSync(join(d, 'relay.json'), JSON.stringify({ amiSecret: 'amisecret', bridgeKey: 'b'.repeat(48) }), { mode: 0o600 })
+    writeFileSync(join(d, 'provisioned.json'), JSON.stringify({ sipDomainName: BRIDGE.domain, sipBridgeUser: BRIDGE.user, sipBridgePassword: BRIDGE.password }), { mode: 0o600 })
+    return d
+  }
+  const cred = join(root, 'sip.credentials')
+  writeFileSync(cred, 'ACME_SIP_REGISTRAR=sip.example.net\nACME_SIP_PORT=5060\nACME_SIP_USERNAME=u100\nACME_SIP_PASSWORD=pw-from-file\nACME_DID=2310123456\n', { mode: 0o600 })
+  // The shape of a production install: relay on, an explicit system include directory, one SIP account.
+  const shared = join(root, 'etc-asterisk-dsh-phone'); mkdirSync(shared)
+  const liveShape = (dir) => resolveSettings({
+    defaultCountry: '+30', defaultLine: 'ca', lines: LINES, twilio: { sipEdge: 'dublin' },
+    sipAccounts: [{ id: 'acme', label: 'Acme', line: 'gr', bridgeVia: 'ca', credentialsFile: cred, ringFirstSeconds: 20, enabled: true }],
+    relay: { enabled: true, configDir: dir, bindAddress: '127.0.0.1', bindPort: 5070, loopback: false, bridgeTransport: 'tls', certFile: '/x/c.crt', keyFile: '/x/c.key' },
+  })
+
+  await t('relay default include directory is per instance, never a system path', () => {
+    process.env.DSH_PHONE_DATA = instance('defaults')
+    assert.equal(resolveSettings({}).relay.configDir, '')
+    assert.equal(relayConfigDir(resolveSettings({})), join(process.env.DSH_PHONE_DATA, 'asterisk'))
+    assert.equal(relayConfigDir(liveShape('/etc/asterisk/dsh-phone')), '/etc/asterisk/dsh-phone')
+  })
+
+  await t('relay: no SIP accounts = nothing written, even when the shared directory exists', async () => {
+    process.env.DSH_PHONE_DATA = instance('noaccounts')
+    writeFileSync(join(shared, 'pjsip.conf'), '; owned by someone else\n')
+    const before = snap(shared), r0 = reloads()
+    for (const s of [resolveSettings({}), resolveSettings({ relay: { configDir: shared } }), resolveSettings({ relay: { enabled: true, configDir: shared }, sipAccounts: [] })]) {
+      const r = await syncRelay(s)
+      assert.equal(r.state, 'off'); assert.equal(r.reason, 'no SIP accounts')
+    }
+    assert.deepEqual(snap(shared), before)
+    assert.equal(existsSync(join(process.env.DSH_PHONE_DATA, 'asterisk')), false, 'default directory not even created')
+    assert.equal(reloads(), r0, 'no AMI reload')
+    rmSync(join(shared, 'pjsip.conf'))
+  })
+
+  await t('relay: disabled relay with accounts = nothing written', async () => {
+    process.env.DSH_PHONE_DATA = instance('disabled')
+    const s = liveShape(shared); s.relay.enabled = false
+    const r = await syncRelay(s)
+    assert.equal(r.state, 'off'); assert.equal(r.reason, 'relay disabled')
+    assert.deepEqual(snap(shared), { 'pjsip.conf': null, 'extensions.conf': null, 'manager.conf': null })
+  })
+
+  let liveId = ''
+  await t('relay: production settings shape writes marked files and reloads (unchanged behaviour)', async () => {
+    process.env.DSH_PHONE_DATA = instance('live')
+    const r0 = reloads()
+    const r = await syncRelay(liveShape(shared))
+    assert.equal(r.state, 'ok', r.errors.join('; '))
+    assert.deepEqual(r.changed.sort(), [...files].sort())
+    liveId = JSON.parse(readFileSync(join(process.env.DSH_PHONE_DATA, 'relay.json'), 'utf8')).instanceId
+    assert.match(liveId, /^[0-9a-f]{16}$/)
+    for (const f of files) {
+      const text = readFileSync(join(shared, f), 'utf8')
+      assert.ok(text.startsWith('; dsh-phone-instance: ' + liveId + ' '), f + ' marker')
+      assert.equal(fileInstance(text), liveId)
+      assert.equal(statSync(join(shared, f)).mode & 0o777, 0o640)
+    }
+    assert.match(readFileSync(join(shared, 'pjsip.conf'), 'utf8'), /password=pw-from-file/)
+    assert.ok(reloads() > r0, 'reloaded over AMI')
+    const again = await syncRelay(liveShape(shared))
+    assert.deepEqual(again.changed, []); assert.equal(again.marked, undefined)
+  })
+
+  await t('relay: upgrade from an unmarked build adopts the files without an Asterisk reload', async () => {
+    for (const f of files) writeFileSync(join(shared, f), readFileSync(join(shared, f), 'utf8').replace(/^; dsh-phone-instance: [^\n]*\n/, ''), { mode: 0o640 })
+    assert.equal(fileInstance(readFileSync(join(shared, 'pjsip.conf'), 'utf8')), '')
+    const r0 = reloads()
+    const r = await syncRelay(liveShape(shared))
+    assert.equal(r.state, 'ok')
+    assert.deepEqual(r.changed, []); assert.deepEqual(r.marked.sort(), [...files].sort())
+    assert.equal(r.restartNeeded, false)
+    assert.equal(reloads(), r0, 'no reload for a marker-only change')
+    for (const f of files) assert.equal(fileInstance(readFileSync(join(shared, f), 'utf8')), liveId)
+  })
+
+  await t('relay: another instance never writes over marked files (PHONE_RELAY_DIR_FOREIGN)', async () => {
+    process.env.DSH_PHONE_DATA = instance('scratch')
+    const before = snap(shared), r0 = reloads()
+    const r = await syncRelay(liveShape(shared))
+    assert.equal(r.state, 'error')
+    assert.match(r.errors[0], /belongs to another dsh-phone instance/)
+    assert.deepEqual(r.changed, [])
+    assert.deepEqual(snap(shared), before, 'files untouched')
+    assert.equal(reloads(), r0)
+    assert.equal(E.has('PHONE_RELAY_DIR_FOREIGN'), true)
+  })
+
+  await t('relay: empty include directory setting writes into the instance\'s own folder', async () => {
+    process.env.DSH_PHONE_DATA = instance('own')
+    const r = await syncRelay(liveShape(''))
+    assert.equal(r.state, 'ok', r.errors.join('; '))
+    assert.equal(r.dir, join(process.env.DSH_PHONE_DATA, 'asterisk'))
+    for (const f of files) assert.ok(existsSync(join(r.dir, f)), f)
+  })
+
+  for (const [k, v] of [['DSH_PHONE_DATA', saved.data], ['DSH_PHONE_ASTERISK_DIR', saved.ast], ['DSH_PHONE_AMI_PORT', saved.ami]]) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v
+  }
+  rmSync(root, { recursive: true, force: true })
+}
 
 // ---------------------------------------------------------------- phone-hookd end to end
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-11-02)
+
+- **Fix: white text on a white button in dark mode.** On a stock DSH theme in dark mode the host primary colour is near white, but the Send and other primary buttons, the outgoing SMS bubble and the unread badges had hard-coded white text. They now use the host's paired foreground token (`--dsw-alias-label-primary-foreground`, white as the fallback), so they read in light and dark and with custom themes; a muted Telegram badge uses the background colour on its grey.
+- **Fix: the SIP relay never writes into a directory it does not own.** phone-hookd wrote its Asterisk include files into `/etc/asterisk/dsh-phone` whenever that directory existed, even with no SIP account configured, so a second install on the same machine (a test instance) could overwrite the real relay. Now nothing is written unless the relay is enabled AND at least one SIP account exists; the include directory (`relay.configDir`) defaults to a private folder of each instance (`<phone data dir>/asterisk`); every generated file starts with an instance marker (`; dsh-phone-instance: <id>`, the id lives in `relay.json`) and an instance refuses to write over files with another instance's marker (new code PHONE_RELAY_DIR_FOREIGN). Files written by an older build are adopted on the first sync without an Asterisk reload.
+- **Upgrading with a running relay:** if you rely on the old default, set **Include directory** to `/etc/asterisk/dsh-phone` in Settings > Phone (installs that saved their settings already have it stored).
+
 ## 0.3.0 (2026-11-02)
 
 - **Telegram:** a Telegram account on the server (Go daemon `telegramd`, private unix socket only), chats, groups, channels and media in the Phone tab, login by QR code or code plus cloud password, `telegram_*` agent tools with conversation-only sending, rate limits, audit log and kill switch. See docs/TELEGRAM.md.

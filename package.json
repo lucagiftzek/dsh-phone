@@ -1,6 +1,6 @@
 {
   "name": "@lucagiftzek/dsh-phone",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Phone for the DeepSeek Harness web GUI: SMS and calls in a sidebar tab (Twilio, SIP lines through an Asterisk relay), call audio through your server, live voicemail with transcripts, a Telegram account with chats, voice messages and calls, and phone_* and telegram_* agent tools.",
   "type": "module",
   "main": "lib/index.js",

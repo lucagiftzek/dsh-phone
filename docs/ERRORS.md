@@ -57,6 +57,7 @@ Webhook answers to the provider stay TwiML (or empty 204) on success; only the r
 | PHONE_AUDIO_SESSION_GONE | 404 | daemon `POST /audio/ticket` | The audio session ended or the call is no longer ringing | Nothing to fix ([details](#phone_audio_session_gone)) |
 | PHONE_AUDIO_LEG_FAILED | 502 | audio socket control `error`, log | The server could not set up the far leg of the call | Run phone_doctor and read the hookd log line ([details](#phone_audio_leg_failed)) |
 | PHONE_RELAY_DIR_UNUSABLE | 500 | log, state `relay.errors` | The media server include directory is missing or not writable | Create it as in RELAY.md install step 2 and add it to `ReadWritePaths` of the daemon unit ([details](#phone_relay_dir_unusable)) |
+| PHONE_RELAY_DIR_FOREIGN | 409 | log, state `relay.errors` | The media server include directory belongs to another dsh-phone instance | Set `relay.configDir` to this instance's own directory; never edit the other instance's files ([details](#phone_relay_dir_foreign)) |
 | PHONE_RELAY_AMI_FAILED | 500 | log, state `relay.errors`, `relay/status` `error` | The media server manager interface (AMI) rejected or did not answer | Read-only: `systemctl status asterisk`, `ss -ltn | grep 5038` ([details](#phone_relay_ami_failed)) |
 | PHONE_RELAY_SYNC_FAILED | 500 | log, state `relay.errors` | Relay configuration could not be written or reloaded | Read the detail and the account `issues` in the state output; correct the settings ([details](#phone_relay_sync_failed)) |
 | PHONE_STORE_UNAVAILABLE | 500 | log at daemon start | The phone database could not be opened | Check `node -v`, the data directory mode and free space; restart the daemon ([details](#phone_store_unavailable)) |
@@ -411,6 +412,14 @@ Webhook answers to the provider stay TwiML (or empty 204) on success; only the r
 - **Likely causes:** The include directory for the generated media server files is missing or not writable by the daemon user.
 - **Agent action:** Create it as in RELAY.md install step 2 and add it to `ReadWritePaths` of the daemon unit.
 - **Needs the human:** yes (root)
+- **Troubleshooting:** [entry](TROUBLESHOOTING.md#t-relay-registration)
+
+### PHONE_RELAY_DIR_FOREIGN
+- **Meaning:** The media server include directory belongs to another dsh-phone instance.
+- **Where:** log, state `relay.errors`. Status 409.
+- **Likely causes:** Two phone-hookd instances (for example a test install next to the real one) point at the same include directory. Each generated file starts with `; dsh-phone-instance: <id>` (the id is kept in `relay.json` of the data directory) and an instance never writes over files that carry another id.
+- **Agent action:** Read-only: `head -1 <dir>/pjsip.conf` and compare with `instanceId` in this instance's `relay.json` (never print the other fields). Point `relay.configDir` at this instance's own directory, or leave the relay off here.
+- **Needs the human:** maybe
 - **Troubleshooting:** [entry](TROUBLESHOOTING.md#t-relay-registration)
 
 ### PHONE_RELAY_AMI_FAILED

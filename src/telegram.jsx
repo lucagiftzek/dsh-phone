@@ -202,7 +202,7 @@ export function createTelegramUI(k) {
               <span className="phx-flex" style={{ flexWrap: 'nowrap' }}>
                 <span className="phx-s phx-grow">{c.last ? (c.last.out ? 'You: ' : '') + c.last.text : kindLabel(c)}</span>
                 {c.pinned ? <span className="phx-s" title="Pinned">pinned</span> : null}
-                {c.unread ? <span className="phx-badge" style={c.muted ? { background: 'var(--ink3)' } : undefined}>{c.unread}</span> : null}
+                {c.unread ? <span className="phx-badge" style={c.muted ? { background: 'var(--ink3)', color: 'var(--bg)' } : undefined}>{c.unread}</span> : null}
               </span>
             </span>
           </button>
