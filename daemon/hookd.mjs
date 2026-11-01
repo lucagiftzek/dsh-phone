@@ -26,12 +26,21 @@ import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
 import { Store } from './store.mjs'
-import { TwilioRest, validateSignature, voiceAccessToken, el, twiml, toE164, smsSegments } from './twilio.mjs'
+import { TwilioRest, TwilioError, validateSignature, voiceAccessToken, el, twiml, toE164, smsSegments } from './twilio.mjs'
 import { transcribe } from './transcribe.mjs'
+import { E, errorBody } from './errors.mjs'
 import {
   VERSION, DEFAULTS, dataDir, socketPath, resolveSettings, twilioCredentials, redact,
-  writeJson0600, writeProvisioned, readProvisioned,
+  writeJson0600, writeProvisioned, readProvisioned, preserveUnknownKeys,
 } from './config.mjs'
+import { normaliseCaller, sipHeaders, sipUser, bridgeSipUri, destinationAllowed, accountCountry } from './sip.mjs'
+import { syncRelay, relayStatus, relaySecrets, bridgeInfo, resolveAccounts, accountView, lastRelaySync, relayWatchdog, amiOptions } from './relay.mjs'
+import { EventEmitter } from 'node:events'
+import { AudioHub } from './audio.mjs'
+import { audioSocketServer } from './audiosocket.mjs'
+import { acceptWebSocket, offeredProtocols, refuseUpgrade } from './ws.mjs'
+import { AmiSession } from './ami.mjs'
+import { createTelegram } from './telegram.mjs'
 
 const PUBLIC_HOST = process.env.DSH_PHONE_HOOK_HOST || '127.0.0.1'
 const PUBLIC_PORT = Number(process.env.DSH_PHONE_HOOK_PORT || 3098)
@@ -48,21 +57,52 @@ const log = (...a) => console.log(new Date().toISOString(), ...a)
 const warn = (...a) => console.error(new Date().toISOString(), 'WARN', ...a)
 const now = () => Math.floor(Date.now() / 1000)
 
-const store = new Store(join(DATA, 'phone.db'))
+let store
+try { store = new Store(join(DATA, 'phone.db')) } catch (e) {
+  console.error(new Date().toISOString(), 'WARN', E.logLine('PHONE_STORE_UNAVAILABLE', e && e.message ? e.message : e))
+  throw e
+}
+
+/** Throwable coded error; `error` keeps the original text (message). */
+const fail = (code, message, status) => E.raise(code, status ? { message, status } : { message })
 
 // ------------------------------------------------------------------ config
 
 let settings = loadConfig()
 
+function readRawConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) } catch { return null }
+}
+
 function loadConfig() {
-  try { return resolveSettings(JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))) } catch { return resolveSettings({}) }
+  const raw = readRawConfig()
+  return resolveSettings(raw || {})
 }
 
 function setConfig(raw) {
-  writeJson0600(CONFIG_FILE, raw || {})
-  settings = resolveSettings(raw || {})
+  // An older plugin build strips keys it does not know (sipAccounts, relay):
+  // keep the stored ones so a dsh-web restart cannot unregister the relay.
+  const next = preserveUnknownKeys(raw || {}, readRawConfig())
+  writeJson0600(CONFIG_FILE, next)
+  settings = resolveSettings(next)
   restCache = null
   broadcast('config', { at: Date.now() })
+  queueRelaySync()
+}
+
+// ------------------------------------------------------------------ SIP relay
+
+let relayTimer = null
+function queueRelaySync(delay = 300) {
+  clearTimeout(relayTimer)
+  relayTimer = setTimeout(() => { syncRelay(settings, { log, warn }).catch(e => warn(E.logLine('PHONE_RELAY_SYNC_FAILED', e.message))) }, delay)
+  relayTimer.unref && relayTimer.unref()
+}
+
+/** The SIP account behind a line, or null. */
+function sipAccountForLine(line) {
+  if (!line || line.provider !== 'sip') return null
+  return resolveAccounts(settings).find(a => a.enabled && a.line === line.id) || null
 }
 
 let restCache = null
@@ -70,7 +110,7 @@ function rest() {
   const c = twilioCredentials(settings)
   const key = c.accountSid.value + ':' + c.authToken.value
   if (restCache && restCache.key === key) return restCache.client
-  if (!c.accountSid.value || !c.authToken.value) throw new Error('Twilio account SID and auth token are not configured')
+  if (!c.accountSid.value || !c.authToken.value) throw fail('PHONE_PROVIDER_NOT_CONFIGURED', 'Twilio account SID and auth token are not configured')
   restCache = { key, client: new TwilioRest({ accountSid: c.accountSid.value, authToken: c.authToken.value }) }
   return restCache.client
 }
@@ -93,7 +133,7 @@ function getMode() {
   return ['live', 'voicemail', 'dnd'].includes(m) ? m : settings.incoming.defaultMode
 }
 function setMode(mode, by) {
-  if (!['live', 'voicemail', 'dnd'].includes(mode)) throw new Error('mode must be live, voicemail or dnd')
+  if (!['live', 'voicemail', 'dnd'].includes(mode)) throw fail('PHONE_MODE_INVALID', 'mode must be live, voicemail or dnd')
   store.set('mode', mode)
   log('mode ->', mode, 'by', by || '?')
   broadcast('mode', { mode, by: by || '' })
@@ -101,6 +141,13 @@ function setMode(mode, by) {
 }
 
 const presence = new Map() // clientId -> { at, registered }
+/** A Phone tab that takes calls through the server audio route is online. */
+function serverBrowserOnline() {
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  for (const p of presence.values()) if (p.at >= cutoff && p.registered && p.audio === 'server') return true
+  return false
+}
+
 function browserOnline() {
   const cutoff = Date.now() - PRESENCE_TTL_MS
   for (const [id, p] of presence) {
@@ -120,6 +167,12 @@ function broadcast(type, data) {
 }
 setInterval(() => { for (const res of sseClients) { try { res.write(': ping\n\n') } catch { sseClients.delete(res) } } }, 20000).unref()
 
+// Telegram: telegramd (Go) holds the account; this bridge stores chats in phone.db and serves /tg/*.
+const tg = createTelegram({
+  store, broadcast, log, warn, dataDir: DATA, transcribe: (audio) => transcribe(settings.voicemail, audio),
+  hub: () => hub, mode: () => getMode(), online: () => browserOnline(), ringSeconds: () => settings.incoming.ringSeconds,
+})
+
 // ------------------------------------------------------------------ helpers
 
 function readBody(req, limit = MAX_BODY) {
@@ -127,7 +180,7 @@ function readBody(req, limit = MAX_BODY) {
     let size = 0; const chunks = []
     req.on('data', c => {
       size += c.length
-      if (size > limit) { reject(Object.assign(new Error('body too large'), { status: 413 })); req.destroy(); return }
+      if (size > limit) { reject(fail('PHONE_BODY_TOO_LARGE', 'body too large')); req.destroy(); return }
       chunks.push(c)
     })
     req.on('end', () => resolveP(Buffer.concat(chunks)))
@@ -258,7 +311,7 @@ async function processRecording(vmId, p) {
     await fsP.writeFile(file, audio.data, { mode: 0o600 })
     store.updateVoicemail(vm.id, { file })
   } catch (e) {
-    warn('recording download failed', e.message)
+    warn(E.logLine('PHONE_RECORDING_DOWNLOAD_FAILED', e.message))
     store.updateVoicemail(vm.id, { status: 'failed' })
     broadcast('vm.update', { vm: store.voicemail(vm.id) })
     return
@@ -267,7 +320,7 @@ async function processRecording(vmId, p) {
     const t = await transcribe(settings.voicemail, { type: 'audio/mpeg', data: audio.data })
     store.updateVoicemail(vm.id, { status: 'ready', transcript: t.text, language: t.language, engine: t.engine })
   } catch (e) {
-    warn('transcription failed', e.message)
+    warn(E.logLine('PHONE_TRANSCRIBE_FAILED', e.message))
     const live = store.voicemail(vm.id).liveText
     store.updateVoicemail(vm.id, { status: 'ready', transcript: live || '', engine: live ? 'live' : 'none' })
   }
@@ -280,14 +333,14 @@ async function processRecording(vmId, p) {
 
 async function sendSms({ to, body, line: lineId, origin = 'ui' }) {
   const line = lineId ? lineById(lineId) : defaultLine()
-  if (!line) throw new Error('no enabled line' + (lineId ? ' with id ' + lineId : ''))
-  if (!line.sms) throw new Error('line ' + line.id + ' has SMS disabled')
-  if (line.provider !== 'twilio') throw new Error('line ' + line.id + ' (' + line.provider + ') cannot send SMS yet')
+  if (!line) throw fail('PHONE_LINE_UNAVAILABLE', 'no enabled line' + (lineId ? ' with id ' + lineId : ''))
+  if (!line.sms) throw fail('PHONE_LINE_UNAVAILABLE', 'line ' + line.id + ' has SMS disabled')
+  if (line.provider !== 'twilio') throw fail('PHONE_LINE_UNAVAILABLE', 'line ' + line.id + ' (' + line.provider + ') cannot send SMS yet')
   const dest = toE164(to, settings.defaultCountry)
-  if (!dest || dest.startsWith('client:')) throw new Error('not a valid phone number: ' + to + (settings.defaultCountry ? '' : ' (use +countrycode, or set a default country in Settings)'))
+  if (!dest || dest.startsWith('client:')) throw fail('PHONE_NUMBER_INVALID', 'not a valid phone number: ' + to + (settings.defaultCountry ? '' : ' (use +countrycode, or set a default country in Settings)'))
   const text = String(body || '').trim()
-  if (!text) throw new Error('empty message')
-  if (text.length > settings.sms.maxChars) throw new Error('message is longer than ' + settings.sms.maxChars + ' characters')
+  if (!text) throw fail('PHONE_MESSAGE_INVALID', 'empty message')
+  if (text.length > settings.sms.maxChars) throw fail('PHONE_MESSAGE_INVALID', 'message is longer than ' + settings.sms.maxChars + ' characters')
   const seg = smsSegments(text)
   const row = store.addMessage({ sid: null, line: line.id, peer: dest, direction: 'out', body: text, status: 'sending', segments: seg.segments, read: true, origin })
   broadcast('sms.out', { message: row })
@@ -304,52 +357,105 @@ async function sendSms({ to, body, line: lineId, origin = 'ui' }) {
   }
 }
 
+// ------------------------------------------------------------------ incoming calls (shared)
+
+/**
+ * The incoming-call plan for any line: block list, Live (ring the browser and
+ * the forward number) or voicemail with the live transcript, DND silence.
+ * ringFirst (SIP lines whose other phones should ring first): when the call
+ * would go straight to voicemail, answer busy without recording anything; the
+ * relay keeps the other phones ringing and calls back with X-Dsh-Voicemail.
+ */
+function incomingCall({ callSid, from, line, callStatus, ringFirst = false }) {
+  const mode = getMode()
+  const contact = store.contact(from)
+  const sipLine = !!(line && line.provider === 'sip')
+  const anonymous = !/^\+?\d{5,}$/.test(from)
+  const blocked = (contact && contact.blocked) || (anonymous && settings.incoming.rejectAnonymous)
+  const ringBrowser = mode === 'live' || (mode === 'dnd' && contact && contact.starred && settings.incoming.dndBypassStarred)
+  const online = browserOnline()
+  const forward = mode === 'live' ? toE164(settings.incoming.forwardTo, settings.defaultCountry) : null
+  const ringsSomething = (ringBrowser && online) || !!(forward && !forward.startsWith('client:'))
+  if (ringFirst && !blocked && !(line && !line.voice) && !ringsSomething) {
+    log('sip line', line ? line.id : '?', 'call from', from, ': nothing to ring here, the relay rings its other phones first')
+    return twiml(el('Reject', { reason: 'busy' }))
+  }
+
+  store.upsertCall({ sid: callSid, line: line ? line.id : '', peer: from, direction: 'in', status: callStatus, disposition: 'ringing', mode, origin: sipLine ? 'sip' : 'provider' })
+
+  if (blocked) {
+    store.upsertCall({ sid: callSid, disposition: 'blocked' })
+    broadcast('call.update', { call: store.callBySid(callSid), silent: true })
+    return twiml(el('Reject', { reason: sipLine ? 'rejected' : 'busy' }))
+  }
+  if (line && !line.voice) {
+    store.upsertCall({ sid: callSid, disposition: 'blocked' })
+    return twiml(el('Reject', { reason: sipLine ? 'rejected' : 'busy' }))
+  }
+
+  // Server audio route (0.2): a Phone tab that takes calls via the server is
+  // online. The call is held on a Twilio Media Stream to hookd (the caller hears
+  // ringback generated here), the tabs ring over the event stream, and the tab
+  // that answers is bridged to the stream. Unanswered after ringSeconds, or
+  // declined, the stream closes and <Connect action> plays voicemail as before.
+  const forwardSet = !!(forward && !forward.startsWith('client:'))
+  let serverRing = null
+  if (ringBrowser && online && !forwardSet && serverBrowserOnline()) {
+    serverRing = hub.ringSession({ callSid, from, line, ringSeconds: settings.incoming.ringSeconds })
+    if (!serverRing) warn('audio: no free server audio slot, ringing the direct route only')
+  }
+  broadcast('call.incoming', { call: store.callBySid(callSid), ringing: ringBrowser && online, silent: isSilent(contact), route: serverRing ? 'server' : 'direct' })
+  if (serverRing) return serverRing.twiml
+
+  const targets = []
+  if (ringBrowser && online) {
+    targets.push(el('Client', {}, [
+      el('Identity', {}, settings.identity),
+      el('Parameter', { name: 'line', value: line ? line.id : '' }),
+      el('Parameter', { name: 'peer', value: from }),
+      el('Parameter', { name: 'name', value: contact && contact.name ? contact.name : '' }),
+    ]))
+  }
+  if (forward && !forward.startsWith('client:')) {
+    targets.push(el('Number', { url: hook('/voice/screen', { from }) }, forward))
+  }
+  if (!targets.length) return voicemailTwiml({ callSid, line, peer: from })
+  return twiml(el('Dial', {
+    timeout: settings.incoming.ringSeconds,
+    answerOnBridge: true,
+    action: hook('/voice/dial-done', { line: line ? line.id : '' }),
+    method: 'POST',
+  }, targets))
+}
+
 // ------------------------------------------------------------------ PUBLIC: webhook handlers
 
 const PUBLIC_ROUTES = {
   async '/voice/incoming'(p, q) {
-    const callSid = one(p.CallSid)
-    const from = one(p.From) || 'anonymous'
     const line = lineById(q.line) || lineForNumber(one(p.To)) || defaultLine()
-    const mode = getMode()
-    const contact = store.contact(from)
-    store.upsertCall({ sid: callSid, line: line ? line.id : '', peer: from, direction: 'in', status: one(p.CallStatus), disposition: 'ringing', mode, origin: 'provider' })
+    return incomingCall({ callSid: one(p.CallSid), from: one(p.From) || 'anonymous', line, callStatus: one(p.CallStatus) })
+  },
 
-    const anonymous = !/^\+?\d{5,}$/.test(from)
-    if ((contact && contact.blocked) || (anonymous && settings.incoming.rejectAnonymous)) {
-      store.upsertCall({ sid: callSid, disposition: 'blocked' })
-      broadcast('call.update', { call: store.callBySid(callSid), silent: true })
-      return twiml(el('Reject', { reason: 'busy' }))
+  /**
+   * A call from the SIP relay through the Twilio SIP Domain (its Voice URL).
+   * The relay sets X-Line (the line id, also the To user) and X-Caller (the
+   * caller in E.164); X-Dsh-Voicemail: 1 marks the second attempt of a
+   * ring-first account, which goes straight to voicemail.
+   */
+  async '/voice/sip'(p) {
+    const h = sipHeaders(p)
+    const lineId = String(h['x-line'] || sipUser(one(p.To)) || '').toLowerCase()
+    const line = lineById(lineId)
+    if (!line || line.provider !== 'sip') {
+      warn(E.logLine('PHONE_SIP_LINE_UNKNOWN', 'sip call for unknown line ' + (lineId || '(none)')))
+      return twiml(el('Reject', { reason: 'rejected' }))
     }
-    if (line && !line.voice) {
-      store.upsertCall({ sid: callSid, disposition: 'blocked' })
-      return twiml(el('Reject', { reason: 'busy' }))
-    }
-
-    const ringBrowser = mode === 'live' || (mode === 'dnd' && contact && contact.starred && settings.incoming.dndBypassStarred)
-    const online = browserOnline()
-    const forward = mode === 'live' ? toE164(settings.incoming.forwardTo, settings.defaultCountry) : null
-    broadcast('call.incoming', { call: store.callBySid(callSid), ringing: ringBrowser && online, silent: isSilent(contact) })
-
-    const targets = []
-    if (ringBrowser && online) {
-      targets.push(el('Client', {}, [
-        el('Identity', {}, settings.identity),
-        el('Parameter', { name: 'line', value: line ? line.id : '' }),
-        el('Parameter', { name: 'peer', value: from }),
-        el('Parameter', { name: 'name', value: contact && contact.name ? contact.name : '' }),
-      ]))
-    }
-    if (forward && !forward.startsWith('client:')) {
-      targets.push(el('Number', { url: hook('/voice/screen', { from }) }, forward))
-    }
-    if (!targets.length) return voicemailTwiml({ callSid, line, peer: from })
-    return twiml(el('Dial', {
-      timeout: settings.incoming.ringSeconds,
-      answerOnBridge: true,
-      action: hook('/voice/dial-done', { line: line ? line.id : '' }),
-      method: 'POST',
-    }, targets))
+    const acct = sipAccountForLine(line)
+    const cc = acct ? accountCountry(acct, settings.defaultCountry) : String(settings.defaultCountry || '').replace(/\D/g, '')
+    let from = normaliseCaller(h['x-caller'] || sipUser(one(p.From)), cc)
+    if (from !== 'anonymous' && !/^\+[1-9]\d{6,14}$/.test(from) && !/^\d{2,15}$/.test(from)) from = 'anonymous'
+    const vmNow = h['x-dsh-voicemail'] === '1'
+    return incomingCall({ callSid: one(p.CallSid), from, line, callStatus: one(p.CallStatus), ringFirst: !!(acct && acct.ringFirstSeconds > 0 && !vmNow) })
   },
 
   async '/voice/dial-done'(p, q) {
@@ -371,6 +477,19 @@ const PUBLIC_ROUTES = {
     }
     store.upsertCall({ sid: callSid, disposition: status === 'busy' ? 'declined' : 'no-answer' })
     return voicemailTwiml({ callSid, line, peer, greeting: !q.pickup })
+  },
+
+  /** <Connect><Stream> ended (server audio route): voicemail for an unanswered ring, else hang up. */
+  async '/voice/stream-done'(p, q) {
+    const callSid = one(p.CallSid)
+    const next = hub.streamDone(callSid)
+    const call = store.callBySid(callSid)
+    if (next === 'voicemail' && call) {
+      if (call.disposition !== 'declined') store.upsertCall({ sid: callSid, disposition: 'no-answer' })
+      const line = lineById(call.line) || defaultLine()
+      return voicemailTwiml({ callSid, line, peer: call.peer })
+    }
+    return twiml(el('Hangup'))
   },
 
   async '/voice/screen'(p, q) {
@@ -397,7 +516,7 @@ const PUBLIC_ROUTES = {
 
   async '/voice/recording'(p, q) {
     // Answer at once; the download and transcription run after the response.
-    setImmediate(() => { processRecording(Number(q.vm), p).catch(e => warn('processRecording', e.message)) })
+    setImmediate(() => { processRecording(Number(q.vm), p).catch(e => warn(E.logLine('PHONE_INTERNAL', 'processRecording ' + e.message))) })
     return null
   },
 
@@ -421,7 +540,7 @@ const PUBLIC_ROUTES = {
       broadcast('vm.live', { vmId: live.vmId, callSid, text: joined, final })
     } else if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       store.updateVoicemail(live.vmId, { live_text: live.finals.join(' ') })
-      if (ev === 'transcription-error') warn('live transcription error', one(p.TranscriptionError) || '', one(p.TranscriptionErrorCode) || '')
+      if (ev === 'transcription-error') warn(E.logLine('PHONE_LIVE_TRANSCRIPT_FAILED', [one(p.TranscriptionError), one(p.TranscriptionErrorCode)].filter(Boolean).join(' ')))
       broadcast('vm.live', { vmId: live.vmId, callSid, text: live.finals.join(' '), final: true, stopped: true })
     }
     return null
@@ -430,6 +549,7 @@ const PUBLIC_ROUTES = {
   async '/voice/status'(p) {
     const callSid = one(p.CallSid)
     const status = one(p.CallStatus)
+    hub.onStatus(callSid, status)
     const call = store.callBySid(callSid)
     if (!call) return null
     const terminal = ['completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(status)
@@ -460,12 +580,13 @@ const PUBLIC_ROUTES = {
   async '/voice/outbound'(p) {
     const callSid = one(p.CallSid)
     if (one(p.From) !== 'client:' + settings.identity) {
-      warn('outbound from unexpected client', one(p.From))
+      warn(E.logLine('PHONE_OUTBOUND_CLIENT_REFUSED', 'outbound from unexpected client ' + one(p.From)))
       return twiml(el('Say', {}, 'This client is not allowed to place calls.'), el('Hangup'))
     }
     const to = toE164(one(p.To), settings.defaultCountry)
     const line = lineById(one(p.line)) || defaultLine()
     if (!to || to.startsWith('client:')) return twiml(el('Say', {}, 'That number is not valid.'), el('Hangup'))
+    if (line && line.voice && line.provider === 'sip') return outboundSip({ callSid, line, to })
     if (!line || !line.voice || line.provider !== 'twilio') return twiml(el('Say', {}, 'No line is available for calls.'), el('Hangup'))
     store.upsertCall({ sid: callSid, line: line.id, peer: to, direction: 'out', status: 'initiated', disposition: 'dialing', mode: getMode(), origin: 'ui' })
     broadcast('call.update', { call: store.callBySid(callSid) })
@@ -524,14 +645,40 @@ const PUBLIC_ROUTES = {
     const status = one(p.MessageStatus) || one(p.SmsStatus)
     const code = one(p.ErrorCode)
     const m = store.setMessageStatus(sid, status, code ? 'error ' + code : '')
+    if (status === 'failed' || status === 'undelivered') warn(E.logLine('PHONE_SMS_DELIVERY_FAILED', 'status ' + status + (code ? ' provider error ' + code : '')))
     if (m) broadcast('sms.status', { message: m })
     return null
   },
 }
 
+/**
+ * Browser call on a SIP line: Twilio dials the registered relay, which checks
+ * the bridge key and places the call through the SIP provider.
+ */
+function outboundSip({ callSid, line, to }) {
+  const acct = sipAccountForLine(line)
+  const bridge = bridgeInfo(settings)
+  if (!acct || acct.mode !== 'bridge' || !bridge) return twiml(el('Say', {}, 'This line is not connected yet.'), el('Hangup'))
+  const allowed = destinationAllowed(acct, to, settings.defaultCountry)
+  if (!allowed.ok) {
+    warn(E.logLine('PHONE_OUTBOUND_DESTINATION_BLOCKED', ['sip outbound refused', line.id, to, allowed.reason].join(' ')))
+    return twiml(el('Say', {}, 'This number cannot be called from this line.'), el('Hangup'))
+  }
+  store.upsertCall({ sid: callSid, line: line.id, peer: to, direction: 'out', status: 'initiated', disposition: 'dialing', mode: getMode(), origin: 'ui' })
+  broadcast('call.update', { call: store.callBySid(callSid) })
+  const uri = bridgeSipUri({ user: bridge.user, domain: bridge.domain, dest: to, key: relaySecrets().bridgeKey, account: acct.id, tls: settings.relay.bridgeTransport === 'tls' })
+  return twiml(el('Dial', {
+    callerId: line.number || undefined,
+    answerOnBridge: true,
+    timeout: 45,
+    action: hook('/voice/out-done'),
+    method: 'POST',
+  }, [el('Sip', {}, uri)]))
+}
+
 async function handlePublic(req, res) {
   try {
-    if (!settings.publicBaseUrl) { res.writeHead(503); res.end(); return }
+    if (!settings.publicBaseUrl) { E.send(res, 'PHONE_PUBLIC_URL_MISSING'); return }
     const base = new URL(settings.publicBaseUrl)
     const basePath = base.pathname.replace(/\/+$/, '')
     const reqUrl = req.url || '/'
@@ -540,24 +687,24 @@ async function handlePublic(req, res) {
     const route = parsed.pathname.replace(/\/+$/, '')
 
     if (req.method === 'GET' && route === '/health') { sendJson(res, 200, { ok: true, service: 'dsh-phone' }); return }
-    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return }
+    if (req.method !== 'POST') { res.setHeader('allow', 'POST'); E.send(res, 'PHONE_METHOD_NOT_ALLOWED'); return }
     const handler = PUBLIC_ROUTES[route]
-    if (!handler) { res.writeHead(404); res.end(); return }
+    if (!handler) { E.send(res, 'PHONE_NOT_FOUND'); return }
 
     const buf = await readBody(req)
     const params = parseForm(buf)
     const token = authToken()
     const signatureUrl = settings.publicBaseUrl + subPath
     if (!token || !validateSignature(token, one(req.headers['x-twilio-signature']), signatureUrl, params)) {
-      warn('rejected unsigned/invalid webhook', route, 'from', one(req.headers['cf-connecting-ip']) || one(req.headers['x-forwarded-for']) || req.socket.remoteAddress)
-      res.writeHead(403); res.end(); return
+      warn(E.logLine('PHONE_SIGNATURE_INVALID', 'rejected unsigned/invalid webhook ' + route + ' from ' + (one(req.headers['cf-connecting-ip']) || one(req.headers['x-forwarded-for']) || req.socket.remoteAddress) + (token ? '' : ' (no auth token configured)')))
+      E.send(res, 'PHONE_SIGNATURE_INVALID'); return
     }
     const q = Object.fromEntries(parsed.searchParams)
     const out = await handler(params, q)
     if (out === null || out === undefined) { res.writeHead(204); res.end(); return }
     sendXml(res, out)
   } catch (e) {
-    warn('public handler error', e && e.stack || e)
+    warn(E.logLine('PHONE_WEBHOOK_HANDLER_FAILED', (e && e.stack) || String(e)))
     // A voice webhook must still say something sensible.
     try { sendXml(res, twiml(el('Say', {}, 'Sorry, something went wrong. Please try again later.'), el('Hangup'))) } catch {}
   }
@@ -591,10 +738,14 @@ function stateSnapshot() {
     counts: store.counts(),
     notifications: settings.notifications,
     voicemail: { enabled: settings.voicemail.enabled, liveTranscript: settings.voicemail.liveTranscript, transcriber: settings.voicemail.transcriber },
+    audio: { route: settings.audio.route, maxCalls: settings.audio.maxCalls },
     credentials: Object.fromEntries(Object.entries(creds).map(([k, v]) => [k, { set: !!v.value, source: v.source, ...(k.endsWith('Sid') && v.value ? { hint: v.value.slice(0, 6) + '...' + v.value.slice(-4) } : {}) }])),
     provisionedAt: prov.updatedAt || null,
     lastApply: store.get('lastApply', null),
     sip: { enabled: !!settings.sip.enabled, label: settings.sip.label },
+    sipAccounts: resolveAccounts(settings).map(a => ({ id: a.id, label: a.label, line: a.line, mode: a.mode, bridgeVia: a.bridgeVia, enabled: a.enabled, issues: a.issues, warnings: a.warnings })),
+    relay: { state: lastRelaySync().state, errors: lastRelaySync().errors, restartNeeded: lastRelaySync().restartNeeded },
+    telegram: tg.summary(),
   }
 }
 
@@ -632,6 +783,14 @@ async function provisionCheck() {
       })
     } catch (e) { out.lines.push({ id: line.id, number: line.number, ok: false, error: e.message }) }
   }
+  if (bridgeWanted() || readProvisioned().sipDomainSid) {
+    out.sip = await checkSipDomain(client)
+    try {
+      const st = await relayStatus(settings)
+      const regs = st.registrations || []
+      out.relay = { ok: !st.error && regs.length > 0 && regs.every(r => r.status === 'Registered'), registrations: regs, error: st.error || (st.sync.errors || []).join('; ') }
+    } catch (e) { out.relay = { ok: false, error: e.message } }
+  }
   try {
     const r = await fetch(settings.publicBaseUrl + '/health', { signal: AbortSignal.timeout(8000), headers: { 'user-agent': 'dsh-phone-selfcheck' } })
     const j = await r.json().catch(() => null)
@@ -659,8 +818,103 @@ function expectedNumberConfig(line) {
   }
 }
 
+// ------------------------------------------------------------------ SIP Domain (relay bridge)
+
+const listOf = (r) => (r && Object.values(r).find(Array.isArray)) || []
+
+/** Whether any enabled SIP account bridges through a Twilio line. */
+function bridgeWanted() {
+  return settings.sipAccounts.some(a => a.enabled && a.mode === 'bridge' && settings.lines.some(l => l.id === a.bridgeVia && l.provider === 'twilio'))
+}
+
+function sipDomainName(accountSid, prov) {
+  const wanted = String(settings.twilio.sipDomain || '').toLowerCase().replace(/[^a-z0-9.-]/g, '')
+  if (wanted) return wanted.endsWith('.sip.twilio.com') ? wanted : wanted + '.sip.twilio.com'
+  if (prov.sipDomainName) return prov.sipDomainName
+  return 'dsh-phone-' + String(accountSid).slice(-8).toLowerCase() + '.sip.twilio.com'
+}
+
+/** A password Twilio accepts for a SIP credential (12+ chars, upper, lower, digit). */
+function sipPassword() {
+  return 'Dp' + randomBytes(18).toString('base64').replace(/[^A-Za-z0-9]/g, '') + '7x'
+}
+
+function bridgeSecure() { return settings.relay.bridgeTransport === 'tls' && settings.relay.bridgeSrtp !== false }
+
+function expectedDomainConfig() {
+  return {
+    VoiceUrl: hook('/voice/sip'),
+    VoiceMethod: 'POST',
+    VoiceStatusCallbackUrl: hook('/voice/status'),
+    VoiceStatusCallbackMethod: 'POST',
+    SipRegistration: 'true',
+    // Secure media (TLS + SRTP enforced) goes with a TLS bridge.
+    Secure: bridgeSecure() ? 'true' : 'false',
+  }
+}
+
+async function provisionSipDomain(client, step) {
+  const creds = twilioCredentials(settings)
+  const prov = readProvisioned()
+  const name = sipDomainName(creds.accountSid.value, prov)
+  // 1. the domain (Voice URL -> /voice/sip, SIP registration on)
+  const domains = listOf(await client.sipDomains())
+  let dom = domains.find(d => d.sid === prov.sipDomainSid) || domains.find(d => d.domain_name === name)
+  const form = { ...expectedDomainConfig(), FriendlyName: 'dsh-phone relay' }
+  if (dom) { await client.updateSipDomain(dom.sid, form); step('SIP Domain', true, 'updated ' + dom.domain_name) }
+  else { dom = await client.createSipDomain({ ...form, DomainName: name }); step('SIP Domain', true, 'created ' + dom.domain_name) }
+  // 2. the credential list with the bridge user
+  const lists = listOf(await client.credentialLists())
+  let cl = lists.find(l => l.sid === prov.sipCredentialListSid) || lists.find(l => l.friendly_name === 'dsh-phone-bridge')
+  if (!cl) cl = await client.createCredentialList('dsh-phone-bridge')
+  const user = prov.sipBridgeUser || 'dshbridge' + randomBytes(3).toString('hex')
+  let password = prov.sipBridgePassword || ''
+  const existing = listOf(await client.credentials(cl.sid)).find(c => c.username === user)
+  if (!existing) {
+    password = password || sipPassword()
+    await client.createCredential(cl.sid, user, password)
+  } else if (!password) {
+    password = sipPassword()
+    await client.updateCredential(cl.sid, existing.sid, password)
+  }
+  writeProvisioned({ sipDomainSid: dom.sid, sipDomainName: dom.domain_name, sipCredentialListSid: cl.sid, sipBridgeUser: user, sipBridgePassword: password })
+  step('SIP credential list', true, 'dsh-phone-bridge, user ' + user + ' (password stored 0600 in ~/.dsh/phone/provisioned.json)')
+  // 3. the list authenticates both registrations and calls on the domain
+  for (const kind of ['Registrations', 'Calls']) {
+    const maps = listOf(await client.domainCredentialMappings(dom.sid, kind))
+    if (!maps.some(m => m.sid === cl.sid || m.credential_list_sid === cl.sid)) await client.mapCredentialList(dom.sid, kind, cl.sid)
+  }
+  step('SIP auth mappings', true, 'registrations + calls use dsh-phone-bridge')
+  const sync = await syncRelay(settings, { log, warn })
+  step('Relay config', sync.state !== 'error', sync.state === 'off' ? 'relay off' : (sync.errors.join('; ') || (sync.changed.length ? 'written: ' + sync.changed.join(', ') : 'unchanged')))
+}
+
+async function checkSipDomain(client) {
+  const prov = readProvisioned()
+  const out = { domain: null, credentials: null, mappings: null }
+  try {
+    const dom = listOf(await client.sipDomains()).find(d => d.sid === prov.sipDomainSid)
+    const want = expectedDomainConfig()
+    out.domain = dom
+      ? { ok: dom.voice_url === want.VoiceUrl && dom.sip_registration === true && !!dom.secure === bridgeSecure(), name: dom.domain_name, voiceUrl: dom.voice_url, registration: dom.sip_registration, secure: !!dom.secure }
+      : { ok: false, error: prov.sipDomainSid ? 'domain not found' : 'not provisioned' }
+  } catch (e) { out.domain = { ok: false, error: e.message } }
+  try {
+    const creds = prov.sipCredentialListSid ? listOf(await client.credentials(prov.sipCredentialListSid)) : []
+    out.credentials = { ok: !!prov.sipBridgePassword && creds.some(c => c.username === prov.sipBridgeUser), user: prov.sipBridgeUser || null }
+  } catch (e) { out.credentials = { ok: false, error: e.message } }
+  try {
+    const kinds = {}
+    for (const kind of ['Registrations', 'Calls']) {
+      kinds[kind] = prov.sipDomainSid ? listOf(await client.domainCredentialMappings(prov.sipDomainSid, kind)).some(m => m.sid === prov.sipCredentialListSid) : false
+    }
+    out.mappings = { ok: kinds.Registrations && kinds.Calls, ...kinds }
+  } catch (e) { out.mappings = { ok: false, error: e.message } }
+  return out
+}
+
 async function provisionApply() {
-  if (!settings.publicBaseUrl) throw new Error('Set the public webhook base URL first (https://your-host/phone-hook).')
+  if (!settings.publicBaseUrl) throw fail('PHONE_PUBLIC_URL_MISSING', 'Set the public webhook base URL first (https://your-host/phone-hook).', 400)
   const client = rest()
   const report = []
   const step = (name, ok, detail) => report.push({ name, ok, detail: detail || '' })
@@ -705,6 +959,10 @@ async function provisionApply() {
       step('Number ' + line.number, true, 'voice + SMS webhooks point at ' + settings.publicBaseUrl)
     } catch (e) { step('Number ' + line.number, false, e.message) }
   }
+  // 4. SIP Domain for the relay bridge (only when a SIP account bridges through Twilio).
+  if (bridgeWanted()) {
+    try { await provisionSipDomain(client, step) } catch (e) { step('SIP Domain', false, e.message) }
+  }
   restCache = null
   const result = { at: new Date().toISOString(), ok: report.every(r => r.ok), report }
   store.set('lastApply', result)
@@ -722,12 +980,15 @@ const PRIVATE_ROUTES = {
   'GET /token': async () => {
     const c = twilioCredentials(settings)
     const ttl = 3600
-    const token = voiceAccessToken({ accountSid: c.accountSid.value, apiKeySid: c.apiKeySid.value, apiKeySecret: c.apiKeySecret.value, identity: settings.identity, appSid: c.twimlAppSid.value, ttl })
+    let token
+    try {
+      token = voiceAccessToken({ accountSid: c.accountSid.value, apiKeySid: c.apiKeySid.value, apiKeySecret: c.apiKeySecret.value, identity: settings.identity, appSid: c.twimlAppSid.value, ttl })
+    } catch (e) { throw fail('PHONE_VOICE_TOKEN_INCOMPLETE', e.message) }
     return { ok: true, token, identity: settings.identity, ttl, edge: settings.twilio.edge || '' }
   },
   'POST /presence': async (b) => {
     const id = String(b.clientId || '').slice(0, 64)
-    if (id) presence.set(id, { at: Date.now(), registered: !!b.registered })
+    if (id) presence.set(id, { at: Date.now(), registered: !!b.registered, audio: b.audio === 'server' ? 'server' : 'direct' })
     return { ok: true, browserOnline: browserOnline() }
   },
   'GET /threads': async (b, q) => ({ ok: true, threads: store.threads({ line: q.line || null, q: q.q || '', limit: intQ(q.limit, 100) }) }),
@@ -739,16 +1000,16 @@ const PRIVATE_ROUTES = {
   'POST /thread/read': async (b) => { const n = store.markThreadRead(b.line, b.peer); broadcast('counts', store.counts()); return { ok: true, marked: n } },
   'POST /thread/delete': async (b) => ({ ok: true, deleted: store.deleteThread(b.line, b.peer) }),
   'POST /sms/send': async (b) => ({ ok: true, message: await sendSms({ to: b.to, body: b.body, line: b.line, origin: b.origin === 'agent' ? 'agent' : 'ui' }) }),
-  'GET /calls': async (b, q) => ({ ok: true, calls: store.calls({ limit: intQ(q.limit, 100) }) }),
+  'GET /calls': async (b, q) => ({ ok: true, calls: store.calls({ limit: intQ(q.limit, 100) }).map(c => (c.line === 'tg' && !c.name ? { ...c, name: (tg.chat(c.peer) || {}).title || '' } : c)) }),
   'POST /calls/seen': async () => { store.markCallsSeen(); broadcast('counts', store.counts()); return { ok: true } },
   'POST /calls/delete': async (b) => ({ ok: true, deleted: store.deleteCall(Number(b.id)) }),
   'POST /call/say': async (b) => {
     const line = b.line ? lineById(b.line) : defaultLine()
-    if (!line || !line.voice || line.provider !== 'twilio') throw new Error('no voice line available')
+    if (!line || !line.voice || line.provider !== 'twilio') throw fail('PHONE_LINE_UNAVAILABLE', 'no voice line available')
     const to = toE164(b.to, settings.defaultCountry)
-    if (!to || to.startsWith('client:')) throw new Error('not a valid phone number: ' + b.to)
+    if (!to || to.startsWith('client:')) throw fail('PHONE_NUMBER_INVALID', 'not a valid phone number: ' + b.to)
     const text = String(b.text || '').trim().slice(0, 1000)
-    if (!text) throw new Error('nothing to say')
+    if (!text) throw fail('PHONE_MESSAGE_INVALID', 'nothing to say')
     const attrs = { voice: b.voice || settings.voicemail.greetingVoice || undefined, language: b.language || settings.voicemail.greetingLanguage || undefined }
     const xml = twiml(el('Pause', { length: 1 }), el('Say', attrs, text), el('Pause', { length: 1 }), el('Say', attrs, text), el('Hangup'))
     const r = await rest().createCall({ To: to, From: line.number, Twiml: xml, StatusCallback: hook('/voice/say-done'), StatusCallbackMethod: 'POST', Timeout: 30 })
@@ -771,16 +1032,19 @@ const PRIVATE_ROUTES = {
   'POST /voicemail/retranscribe': async (b) => {
     const v = store.voicemail(Number(b.id))
     const row = v && store.db.prepare('SELECT file FROM voicemails WHERE id=?').get(v.id)
-    if (!row || !row.file) throw new Error('no audio for this voicemail')
-    const t = await transcribe({ ...settings.voicemail, transcriber: b.engine || settings.voicemail.transcriber }, { type: 'audio/mpeg', data: await fsP.readFile(row.file) })
+    if (!row || !row.file) throw fail('PHONE_VOICEMAIL_NO_AUDIO', 'no audio for this voicemail', 400)
+    let t
+    try {
+      t = await transcribe({ ...settings.voicemail, transcriber: b.engine || settings.voicemail.transcriber }, { type: 'audio/mpeg', data: await fsP.readFile(row.file) })
+    } catch (e) { throw fail('PHONE_TRANSCRIBE_FAILED', e.message) }
     const out = store.updateVoicemail(v.id, { transcript: t.text, language: t.language, engine: t.engine })
     broadcast('vm.update', { vm: out })
     return { ok: true, vm: out }
   },
   'POST /pickup': async (b) => {
     const vm = b.vmId ? store.voicemail(Number(b.vmId)) : store.voicemailByCall(String(b.callSid || ''))
-    if (!vm) throw new Error('voicemail not found')
-    if (!['recording', 'greeting'].includes(vm.status)) throw new Error('the caller is no longer leaving a message')
+    if (!vm) throw fail('PHONE_VOICEMAIL_NOT_FOUND', 'voicemail not found')
+    if (!['recording', 'greeting'].includes(vm.status)) throw fail('PHONE_PICKUP_TOO_LATE', 'the caller is no longer leaving a message')
     const token = String(b.token || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32)
     const xml = twiml(
       settings.voicemail.liveTranscript ? el('Stop', {}, [el('Transcription', { name: 'vm' + vm.id })]) : null,
@@ -800,10 +1064,13 @@ const PRIVATE_ROUTES = {
     broadcast('vm.update', { vm: out })
     return { ok: true, vm: out }
   },
+  'GET /audio/info': async () => ({ ...hub.info(), audioSocket: audioSocketState, stream: !!settings.publicBaseUrl }),
+  'POST /audio/ticket': async (b) => hub.issueTicket(b || {}, { lineById, defaultLine, toE164, defaultCountry: settings.defaultCountry, voicemailById: (id) => store.voicemail(id) }),
+  'POST /audio/decline': async (b) => ({ ok: true, declined: hub.decline(String(b.callSid || '')) }),
   'GET /contacts': async (b, q) => ({ ok: true, contacts: store.contacts({ q: q.q || '' }) }),
   'POST /contacts/save': async (b) => {
     const number = toE164(b.number, settings.defaultCountry)
-    if (!number || number.startsWith('client:')) throw new Error('not a valid phone number')
+    if (!number || number.startsWith('client:')) throw fail('PHONE_NUMBER_INVALID', 'not a valid phone number')
     const c = store.saveContact({ number, name: b.name, starred: b.starred, blocked: b.blocked, note: b.note })
     broadcast('contacts', { contact: c })
     return { ok: true, contact: c }
@@ -815,7 +1082,16 @@ const PRIVATE_ROUTES = {
     const list = await rest().numbers()
     return { ok: true, numbers: (list.incoming_phone_numbers || []).map(n => ({ sid: n.sid, number: n.phone_number, name: n.friendly_name, capabilities: n.capabilities, voiceUrl: n.voice_url, smsUrl: n.sms_url })) }
   },
+  'GET /relay/status': async () => ({ ok: true, relay: await relayStatus(settings) }),
+  'POST /relay/sync': async () => ({ ok: true, sync: await syncRelay(settings, { log, warn }) }),
   'GET /balance': async () => { const b = await rest().balance(); return { ok: true, balance: b.balance, currency: b.currency } },
+}
+
+/** Coded body for anything a private route threw; the legacy status rule is applied by the caller. */
+function privateErrorBody(e) {
+  if (e instanceof TwilioError) return errorBody(E, e, e.status === 401 ? 'PHONE_PROVIDER_AUTH_FAILED' : 'PHONE_PROVIDER_REQUEST_FAILED')
+  if (e && (e.name === 'TimeoutError' || e.name === 'AbortError' || (e.name === 'TypeError' && /fetch failed/i.test(String(e.message))))) return errorBody(E, e, 'PHONE_PROVIDER_UNREACHABLE')
+  return errorBody(E, e, 'PHONE_INTERNAL')
 }
 
 async function handlePrivate(req, res) {
@@ -832,7 +1108,7 @@ async function handlePrivate(req, res) {
     if (req.method === 'GET' && path === '/voicemail/audio') {
       const v = store.voicemail(Number(url.searchParams.get('id')))
       const row = v && store.db.prepare('SELECT file FROM voicemails WHERE id=?').get(v.id)
-      if (!row || !row.file || !row.file.startsWith(REC_DIR)) { sendJson(res, 404, { ok: false, error: 'no audio' }); return }
+      if (!row || !row.file || !row.file.startsWith(REC_DIR)) { E.send(res, 'PHONE_VOICEMAIL_NO_AUDIO', { message: 'no audio' }); return }
       const st = await fsP.stat(row.file)
       const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''))
       if (range) {
@@ -852,23 +1128,115 @@ async function handlePrivate(req, res) {
       res.end(m.data)
       return
     }
+    if (path.startsWith('/tg/') && await tg.handle(req, res, path, url, { readBody, sendJson })) return
     const fn = PRIVATE_ROUTES[req.method + ' ' + path]
-    if (!fn) { sendJson(res, 404, { ok: false, error: 'not found' }); return }
+    if (!fn) { E.send(res, 'PHONE_NOT_FOUND'); return }
     let body = {}
     if (req.method !== 'GET') {
       const buf = await readBody(req, 512 * 1024)
-      body = buf.length ? JSON.parse(buf.toString('utf8')) : {}
+      try { body = buf.length ? JSON.parse(buf.toString('utf8')) : {} } catch (e) { throw fail('PHONE_BODY_INVALID', e.message) }
     }
     const out = await fn(body, Object.fromEntries(url.searchParams))
     sendJson(res, 200, out)
   } catch (e) {
-    sendJson(res, e.status && e.status < 500 ? e.status : 400, { ok: false, error: String(e && e.message || e) })
+    const body = privateErrorBody(e)
+    if (['PHONE_INTERNAL', 'PHONE_PROVIDER_AUTH_FAILED', 'PHONE_PROVIDER_REQUEST_FAILED', 'PHONE_PROVIDER_UNREACHABLE'].includes(body.code)) warn(E.logLine(body.code, req.method + ' ' + path + ' ' + (e && e.message ? e.message : e)))
+    sendJson(res, e.status && e.status < 500 ? e.status : 400, body)
   }
 }
 
 // ------------------------------------------------------------------ start
 
+// ------------------------------------------------------------------ server audio route
+
+/** Asterisk side of the hub: one AMI session with call events while SIP calls are up. */
+function asteriskAdapter() {
+  const em = new EventEmitter()
+  em.setMaxListeners(50)
+  let ami = null
+  let idle = null
+  const session = async () => {
+    clearTimeout(idle)
+    if (ami && !ami.closed) return ami.connect()
+    const a = new AmiSession({ ...amiOptions(settings), events: 'call' })
+    ami = a
+    a.on('event', (ev) => em.emit('event', ev))
+    a.on('close', () => { if (ami === a) ami = null })
+    return a.connect()
+  }
+  em.originate = async ({ uuid, channelId, account, dest }) => {
+    const a = await session()
+    const r = await a.action({
+      Action: 'Originate', Channel: 'AudioSocket/127.0.0.1:' + AS_PORT + '/' + uuid,
+      Context: 'dshp-srv-' + account.id, Exten: 's', Priority: 1, Async: 'true', ChannelId: channelId,
+      Variable: 'DSHP_DEST=' + dest, Timeout: 20000,
+    })
+    if (r.Response !== 'Success') throw fail('PHONE_AUDIO_LEG_FAILED', 'Asterisk refused the call: ' + (r.Message || 'no reason'))
+  }
+  em.hangup = async (channel) => { const a = await session(); await a.action({ Action: 'Hangup', Channel: channel }) }
+  em.dtmf = async (channel, digit) => {
+    const a = await session()
+    const r = await a.action({ Action: 'PlayDTMF', Channel: channel, Digit: digit, Duration: 120 })
+    if (r.Response !== 'Success') throw new Error(r.Message || 'PlayDTMF failed')
+  }
+  em.release = () => {
+    clearTimeout(idle)
+    idle = setTimeout(() => { if (!hub.active(['out', 'in']) && ami) { ami.close(); ami = null } }, 30000)
+    idle.unref && idle.unref()
+  }
+  return em
+}
+
+// Fixed at boot (the listener binds once): a port change needs a hookd restart.
+const AS_PORT = Number(process.env.DSH_PHONE_AUDIOSOCKET_PORT || settings.audio.audioSocketPort)
+
+function streamUrl() { return settings.publicBaseUrl.replace(/^https:/i, 'wss:') + '/s' }
+
+const hub = new AudioHub({
+  settings: () => settings, log, warn, store, broadcast, fail,
+  hookUrl: hook, streamUrl, mode: getMode,
+  twilio: { createCall: (f) => rest().createCall(f), updateCall: (sid, f) => rest().updateCall(sid, f) },
+  asterisk: asteriskAdapter(),
+  tg: tg.callApi,
+  sipAccount: sipAccountForLine,
+  allowed: (acct, to) => destinationAllowed(acct, to, settings.defaultCountry),
+  onPickup: (vmId, callSid) => {
+    const out = store.updateVoicemail(Number(vmId), { picked_up: true, status: 'picked_up' })
+    store.upsertCall({ sid: callSid, disposition: 'picked_up' })
+    broadcast('vm.update', { vm: out })
+  },
+})
+
+let audioSocketState = 'off'
+const asServer = audioSocketServer({ host: '127.0.0.1', port: AS_PORT, claim: (uuid) => hub.claimAudioSocket(uuid), log, warn })
+asServer.on('listening', () => { audioSocketState = 'listening' })
+asServer.on('error', () => { audioSocketState = 'error' })
+
+let publicStreams = 0
 const pub = http.createServer(handlePublic)
+pub.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => {})
+  try {
+    const base = settings.publicBaseUrl ? new URL(settings.publicBaseUrl) : null
+    const basePath = base ? base.pathname.replace(/\/+$/, '') : ''
+    const p = String(req.url || '').split('?')[0]
+    if (!base || (p !== basePath + '/s' && p !== basePath + '/s/')) { refuseUpgrade(socket, 404); return }
+    const token = authToken()
+    const sig = one(req.headers['x-twilio-signature'])
+    const url = streamUrl()
+    const signed = !!token && !!sig && (validateSignature(token, sig, url, {}) || validateSignature(token, sig, url + '/', {}))
+    if (!signed) {
+      warn(E.logLine('PHONE_SIGNATURE_INVALID', 'rejected stream upgrade without a valid signature from ' + (one(req.headers['cf-connecting-ip']) || one(req.headers['x-forwarded-for']) || req.socket.remoteAddress)))
+      refuseUpgrade(socket, 403); return
+    }
+    if (publicStreams >= settings.audio.maxCalls + 4) { refuseUpgrade(socket, 503); return }
+    const conn = acceptWebSocket(req, socket, head, { maxPayload: 64 * 1024 })
+    if (!conn) return
+    publicStreams++
+    conn.on('close', () => { publicStreams-- })
+    hub.attachTwilio(conn, { signed })
+  } catch (e) { warn('stream upgrade', e.message); try { socket.destroy() } catch {} }
+})
 pub.requestTimeout = 15000
 pub.headersTimeout = 10000
 pub.listen(PUBLIC_PORT, PUBLIC_HOST, () => log('public webhooks on http://' + PUBLIC_HOST + ':' + PUBLIC_PORT, '->', settings.publicBaseUrl))
@@ -876,18 +1244,37 @@ pub.listen(PUBLIC_PORT, PUBLIC_HOST, () => log('public webhooks on http://' + PU
 const sock = socketPath()
 try { fs.rmSync(sock, { force: true }) } catch {}
 const priv = http.createServer(handlePrivate)
+// Browser audio socket (the DSH plugin pipes the authenticated upgrade here).
+priv.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => {})
+  try {
+    const p = String(req.url || '').split('?')[0]
+    if (p !== '/audio/io') { refuseUpgrade(socket, 404); return }
+    const protos = offeredProtocols(req)
+    const k = (protos.find(x => x.startsWith('k.')) || '').slice(2)
+    if (!protos.includes('dshp.v1')) { refuseUpgrade(socket, 400, 'protocol dshp.v1 required'); return }
+    if (!hub.ticketValid(k)) { refuseUpgrade(socket, 403, 'ticket invalid or expired'); return }
+    const conn = acceptWebSocket(req, socket, head, { protocol: 'dshp.v1', maxPayload: 16 * 1024 })
+    if (conn) hub.attachBrowser(k, conn)
+  } catch (e) { warn('audio upgrade', e.message); try { socket.destroy() } catch {} }
+})
 priv.listen(sock, () => {
   try { fs.chmodSync(sock, 0o600) } catch {}
   log('private API on unix:' + sock)
 })
 
 if (!store.get('mode', null)) store.set('mode', settings.incoming.defaultMode)
+tg.start()
+queueRelaySync(1000)
+setInterval(() => { relayWatchdog(settings, { log, warn }).catch(e => warn('relay watchdog', e.message)) }, 120000).unref()
 log('dsh-phone hookd ' + VERSION + ' ready; mode=' + getMode() + '; lines=' + settings.lines.map(l => l.id + ':' + l.number).join(',') + '; boot=' + randomBytes(3).toString('hex'))
 
 function shutdown() {
   log('shutting down')
   for (const res of sseClients) { try { res.end() } catch {} }
-  pub.close(); priv.close()
+  try { hub.shutdown() } catch {}
+  try { tg.shutdown() } catch {}
+  pub.close(); priv.close(); try { asServer.close() } catch {}
   try { fs.rmSync(sock, { force: true }) } catch {}
   store.close()
   process.exit(0)

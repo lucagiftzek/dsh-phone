@@ -32,9 +32,9 @@ Status legend: **done** (in this release, tested on a real line), **next** (bein
 
 | Option | Status |
 |---|---|
-| SIP **account** with registration (REGISTER + digest auth): residential and small-business VoIP (for example Yuboto in Greece, VoIP.ms, sipgate, Zadarma, OVHcloud VoIP, Telnyx SIP connections) | **next**, bridge mode first |
+| SIP **account** with registration (REGISTER + digest auth): residential and small-business VoIP (for example Yuboto in Greece, VoIP.ms, sipgate, Zadarma, OVHcloud VoIP, Telnyx SIP connections) | **built** (bridge mode, see [RELAY.md](RELAY.md)): registration and call routing tested on a real line; behind NAT the RTP ports must be reachable |
 | SIP **trunk** with IP authentication (no REGISTER): business trunks, Twilio Elastic SIP Trunking, Telnyx, Bandwidth | planned (same relay, `identify` by provider IPs) |
-| **Bridge mode**: the relay forwards calls into a CPaaS line (Twilio SIP Domain with registration), so the landline gets the same browser phone, voicemail, live transcript, DND and logs. Small extra per-minute cost for the CPaaS SIP leg. | **next** |
+| **Bridge mode**: the relay forwards calls into a CPaaS line (Twilio SIP Domain with registration), so the landline gets the same browser phone, voicemail, live transcript, DND and logs. Small extra per-minute cost for the CPaaS SIP leg. | **built** ([RELAY.md](RELAY.md)) |
 | **Direct mode**: the relay offers WebRTC (SIP over WSS, DTLS-SRTP) to an in-browser SIP client (SIP.js or JsSIP); voicemail and live transcripts handled by the relay + phone-hookd (Asterisk ARI). No CPaaS at all. | planned |
 | Your own PBX (Asterisk, FreeSWITCH, FreePBX, 3CX, Wazo) as the "provider": register the relay as an extension or trunk | planned (same configuration as a SIP account) |
 | Desk phones / softphones on the same relay (message-waiting light for voicemail, RFC 3842) | listed |

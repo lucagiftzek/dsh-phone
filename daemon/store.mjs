@@ -85,6 +85,9 @@ export class Store {
     this.db = new DatabaseSync(file)
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=3000;')
     this.db.exec(SCHEMA)
+    // 0.2: per-call audio route + stats (server-routed audio). Additive column.
+    const cols = this.db.prepare('PRAGMA table_info(calls)').all().map(c => c.name)
+    if (!cols.includes('audio')) this.db.exec("ALTER TABLE calls ADD COLUMN audio TEXT NOT NULL DEFAULT ''")
   }
 
   close() { try { this.db.close() } catch {} }
@@ -163,12 +166,14 @@ export class Store {
       for (const k of ['status', 'disposition', 'ended', 'duration', 'peer', 'line']) {
         if (c[k] !== undefined && c[k] !== null && c[k] !== '') { fields.push(k + '=?'); args.push(c[k]) }
       }
+      if (c.audio && typeof c.audio === 'object') { fields.push('audio=?'); args.push(JSON.stringify(c.audio)) }
       if (fields.length) this.db.prepare('UPDATE calls SET ' + fields.join(',') + ' WHERE sid=?').run(...args, c.sid)
       return this.callBySid(c.sid)
     }
-    this.db.prepare(`INSERT INTO calls(sid,line,peer,direction,status,disposition,mode,started,ended,duration,seen,origin)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(c.sid, c.line || '', c.peer || '', c.direction || 'in', c.status || '',
-      c.disposition || '', c.mode || '', c.started || now(), c.ended || null, c.duration || 0, c.seen ? 1 : 0, c.origin || '')
+    this.db.prepare(`INSERT INTO calls(sid,line,peer,direction,status,disposition,mode,started,ended,duration,seen,origin,audio)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(c.sid, c.line || '', c.peer || '', c.direction || 'in', c.status || '',
+      c.disposition || '', c.mode || '', c.started || now(), c.ended || null, c.duration || 0, c.seen ? 1 : 0, c.origin || '',
+      c.audio ? JSON.stringify(c.audio) : '')
     return this.callBySid(c.sid)
   }
   callBySid(sid) { return rowCall(this.db.prepare('SELECT c.*, k.name AS name FROM calls c LEFT JOIN contacts k ON k.number=c.peer WHERE c.sid=?').get(sid)) }
@@ -241,7 +246,11 @@ function rowMessage(r) {
 }
 function rowCall(r) {
   if (!r) return null
-  return { id: r.id, sid: r.sid, line: r.line, peer: r.peer, name: r.name || '', direction: r.direction, status: r.status, disposition: r.disposition, mode: r.mode, started: r.started, ended: r.ended, duration: r.duration, seen: !!r.seen, origin: r.origin }
+  return { id: r.id, sid: r.sid, line: r.line, peer: r.peer, name: r.name || '', direction: r.direction, status: r.status, disposition: r.disposition, mode: r.mode, started: r.started, ended: r.ended, duration: r.duration, seen: !!r.seen, origin: r.origin, audio: parseAudio(r.audio) }
+}
+function parseAudio(v) {
+  if (!v) return null
+  try { const o = JSON.parse(v); return o && typeof o === 'object' ? o : null } catch { return null }
 }
 function rowVm(r) {
   if (!r) return null

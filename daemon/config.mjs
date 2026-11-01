@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, chmodSync } from 'n
 import { join, resolve, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { readEnvFile } from './transcribe.mjs'
+import { normaliseSipAccounts } from './sip.mjs'
 
 export const VERSION = '0.1.0'
 
@@ -35,6 +36,8 @@ export const DEFAULTS = {
     twimlAppSid: '',
     credentialsFile: '~/.config/twilio/credentials',
     edge: '',
+    sipDomain: '',
+    sipEdge: '',
   },
   lines: [],
   incoming: {
@@ -76,6 +79,51 @@ export const DEFAULTS = {
     allowCalls: true,
     allowModeChange: true,
   },
+  // Call audio route (0.2). 'server' = the browser sends and receives audio over
+  // one wss socket to this host and the server bridges it to the call (Asterisk
+  // AudioSocket for SIP lines, Twilio Media Streams for Twilio lines). 'direct'
+  // = the Twilio Voice SDK in the browser (WebRTC straight to Twilio).
+  audio: {
+    route: 'server',
+    maxCalls: 2,
+    maxTests: 2,
+    packetMs: 40,
+    jitterMinMs: 40,
+    jitterMaxMs: 400,
+    testSeconds: 30,
+    audioSocketPort: 9093,
+    ringbackTone: '',
+  },
+  // SIP accounts behind the Asterisk relay (see daemon/sip.mjs for every field).
+  sipAccounts: [],
+  relay: {
+    enabled: true,
+    configDir: '/etc/asterisk/dsh-phone',
+    bindAddress: '',
+    bindPort: 5070,
+    loopback: true,
+    tcp: false,
+    localNets: [],
+    externalMediaAddress: '',
+    externalSignalingAddress: '',
+    externalSignalingPort: 0,
+    rtpKeepalive: 2,
+    // Twilio bridge transport: 'tls' (5061, SRTP, hides SIP from router ALGs) or 'udp'.
+    bridgeTransport: 'udp',
+    bridgeSrtp: true,
+    tlsPort: 5061,
+    caFile: '/etc/ssl/certs/ca-certificates.crt',
+    // TLS listener for calls Twilio sends to the relay: certificate + public Contact
+    // (the address and the router-forwarded port Twilio connects to).
+    certFile: '',
+    keyFile: '',
+    tlsExternalAddress: '',
+    tlsExternalPort: 0,
+    amiHost: '127.0.0.1',
+    amiPort: 5038,
+    amiUser: 'dsh-phone',
+  },
+  // Legacy single SIP line of 0.1.x (never wired). Kept so old settings stay valid; sipAccounts replaces it.
   sip: {
     enabled: false,
     label: 'SIP line',
@@ -88,6 +136,17 @@ export const DEFAULTS = {
 }
 
 export const SECRET_PATHS = ['twilio.authToken', 'twilio.apiKeySecret', 'sip.password']
+/** Secrets inside arrays of objects keyed by id: [arrayKey, field]. */
+export const SECRET_ARRAY_PATHS = [['sipAccounts', 'password']]
+/**
+ * Keys an older plugin build does not know. Its schema strips them before it
+ * pushes the settings to phone-hookd, so hookd keeps the previous value when a
+ * push arrives without them (see preserveUnknownKeys).
+ */
+export const PRESERVE_IF_MISSING = ['sipAccounts', 'relay', 'twilio.sipDomain', 'twilio.sipEdge',
+  'relay.bridgeTransport', 'relay.bridgeSrtp', 'relay.tlsPort', 'relay.caFile', 'relay.certFile', 'relay.keyFile', 'relay.tlsExternalAddress', 'relay.tlsExternalPort', 'audio']
+/** Fields inside sipAccounts[] items an older plugin build strips (kept per account id). */
+export const PRESERVE_ACCOUNT_FIELDS = ['callPort', 'callSourcePort']
 
 export function dshHome() { return process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), '.dsh') }
 export function dataDir() { return process.env.DSH_PHONE_DATA ? resolve(process.env.DSH_PHONE_DATA) : join(dshHome(), 'phone') }
@@ -133,6 +192,14 @@ export function normaliseLines(lines) {
 export function resolveSettings(raw) {
   const s = merge(DEFAULTS, isObj(raw) ? raw : {})
   s.lines = normaliseLines(s.lines)
+  s.sipAccounts = normaliseSipAccounts(s.sipAccounts)
+  s.relay.localNets = Array.isArray(s.relay.localNets) ? s.relay.localNets.map(String).filter(Boolean) : []
+  s.relay.bindPort = clampInt(s.relay.bindPort, 1024, 65535, 5070)
+  s.relay.amiPort = clampInt(s.relay.amiPort, 1, 65535, 5038)
+  s.relay.tlsPort = clampInt(s.relay.tlsPort, 1024, 65535, 5061)
+  s.relay.bridgeTransport = s.relay.bridgeTransport === 'tls' ? 'tls' : 'udp'
+  s.relay.tlsExternalPort = clampInt(s.relay.tlsExternalPort, 0, 65535, 0)
+  s.twilio.sipEdge = String(s.twilio.sipEdge || '').toLowerCase().replace(/[^a-z-]/g, '')
   s.trustedHosts = Array.isArray(s.trustedHosts) ? s.trustedHosts.map(String).filter(Boolean) : []
   s.publicBaseUrl = /^https:\/\/[^/]+/i.test(String(s.publicBaseUrl || '')) ? String(s.publicBaseUrl).replace(/\/+$/, '') : ''
   s.identity = String(s.identity || DEFAULTS.identity).replace(/[^A-Za-z0-9_.@-]/g, '').slice(0, 64) || DEFAULTS.identity
@@ -140,8 +207,28 @@ export function resolveSettings(raw) {
   s.incoming.ringSeconds = clampInt(s.incoming.ringSeconds, 5, 60, 25)
   s.voicemail.maxSeconds = clampInt(s.voicemail.maxSeconds, 10, 600, 120)
   s.sms.maxChars = clampInt(s.sms.maxChars, 70, 1600, 1600)
+  s.audio = normaliseAudio(s.audio)
   if (!s.defaultLine || !s.lines.some(l => l.id === s.defaultLine)) s.defaultLine = (s.lines.find(l => l.enabled) || {}).id || ''
   return s
+}
+
+/** Audio route settings, clamped to safe ranges. */
+export function normaliseAudio(a) {
+  const x = isObj(a) ? a : {}
+  const D = DEFAULTS.audio
+  const packet = [20, 40, 60].includes(Number(x.packetMs)) ? Number(x.packetMs) : D.packetMs
+  const jmin = clampInt(x.jitterMinMs, 20, 200, D.jitterMinMs)
+  return {
+    route: x.route === 'direct' ? 'direct' : 'server',
+    maxCalls: clampInt(x.maxCalls, 0, 8, D.maxCalls),
+    maxTests: clampInt(x.maxTests, 0, 8, D.maxTests),
+    packetMs: packet,
+    jitterMinMs: jmin,
+    jitterMaxMs: Math.max(jmin + 40, clampInt(x.jitterMaxMs, 100, 1000, D.jitterMaxMs)),
+    testSeconds: clampInt(x.testSeconds, 5, 120, D.testSeconds),
+    audioSocketPort: clampInt(x.audioSocketPort, 1024, 65535, D.audioSocketPort),
+    ringbackTone: ['eu', 'us', 'uk', ''].includes(x.ringbackTone) ? x.ringbackTone : '',
+  }
 }
 
 function clampInt(v, lo, hi, dflt) {
@@ -198,7 +285,39 @@ export function redact(settings) {
     const [a, b] = p.split('.')
     if (s[a] && b in s[a]) s[a][b] = s[a][b] ? '__set__' : ''
   }
+  for (const [arr, field] of SECRET_ARRAY_PATHS) {
+    if (!Array.isArray(s[arr])) continue
+    for (const item of s[arr]) if (isObj(item) && field in item) item[field] = item[field] ? '__set__' : ''
+  }
   return s
+}
+
+/** phone-hookd side: keep keys an older plugin build stripped from its push. */
+export function preserveUnknownKeys(next, prev) {
+  const out = isObj(next) ? structuredClone(next) : {}
+  if (!isObj(prev)) return out
+  for (const p of PRESERVE_IF_MISSING) {
+    const keys = p.split('.')
+    let src = prev
+    for (const k of keys) src = isObj(src) ? src[k] : undefined
+    if (src === undefined) continue
+    let dst = out
+    for (const k of keys.slice(0, -1)) {
+      if (!isObj(dst[k])) { if (dst[k] !== undefined) { dst = null; break } dst[k] = {} }
+      dst = dst[k]
+    }
+    const last = keys[keys.length - 1]
+    if (dst && !(last in dst)) dst[last] = structuredClone(src)
+  }
+  if (Array.isArray(out.sipAccounts) && Array.isArray(prev.sipAccounts)) {
+    for (const item of out.sipAccounts) {
+      if (!isObj(item)) continue
+      const old = prev.sipAccounts.find(o => isObj(o) && String(o.id || '').toLowerCase() === String(item.id || '').toLowerCase())
+      if (!old) continue
+      for (const f of PRESERVE_ACCOUNT_FIELDS) if (!(f in item) && f in old) item[f] = structuredClone(old[f])
+    }
+  }
+  return out
 }
 
 /** Apply a settings patch from the UI: "__set__" means "keep the stored secret". */
@@ -207,6 +326,15 @@ export function sanitisePatch(patch, current) {
   for (const p of SECRET_PATHS) {
     const [a, b] = p.split('.')
     if (out[a] && out[a][b] === '__set__') out[a][b] = (current && current[a] && current[a][b]) || ''
+  }
+  for (const [arr, field] of SECRET_ARRAY_PATHS) {
+    if (!Array.isArray(out[arr])) continue
+    const old = current && Array.isArray(current[arr]) ? current[arr] : []
+    for (const item of out[arr]) {
+      if (!isObj(item) || item[field] !== '__set__') continue
+      const prev = old.find(o => isObj(o) && String(o.id || '').toLowerCase() === String(item.id || '').toLowerCase())
+      item[field] = (prev && prev[field]) || ''
+    }
   }
   delete out.__proto__
   return out

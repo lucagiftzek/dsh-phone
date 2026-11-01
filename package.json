@@ -1,7 +1,7 @@
 {
   "name": "dsh-phone",
-  "version": "0.1.0",
-  "description": "Phone for the DeepSeek Harness web GUI: a sidebar tab to send and receive SMS, place and receive calls in the browser, Live / Voicemail / Do-not-disturb modes with iOS-style live voicemail (real-time transcript + pick up), local voicemail transcription, and phone_* agent tools. Twilio today, SIP lines next. Configured from DSH Settings.",
+  "version": "0.3.0",
+  "description": "Phone for the DeepSeek Harness web GUI: SMS and calls in a sidebar tab (Twilio, SIP lines through an Asterisk relay), call audio through your server, live voicemail with transcripts, a Telegram account with chats, voice messages and calls, and phone_* and telegram_* agent tools.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -15,16 +15,19 @@
   "files": [
     "lib",
     "daemon",
+    "shared",
     "deploy",
     "cordis.patch.yml",
     "docs",
+    "skills",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node test/run.mjs",
-    "check": "for f in lib/index.js lib/security.js lib/hookc.js daemon/hookd.mjs daemon/store.mjs daemon/twilio.mjs daemon/transcribe.mjs; do node --check $f || exit 1; done && node test/run.mjs"
+    "test": "node test/run.mjs && node test/dual.mjs && node test/relay.mjs && node test/errors.mjs && node test/doctor.mjs && node test/audio.mjs && node test/telegram.mjs && node test/tg-transcribe.mjs && node test/tg-calls.mjs",
+    "check": "for f in lib/index.js lib/security.js lib/hookc.js daemon/hookd.mjs daemon/store.mjs daemon/twilio.mjs daemon/transcribe.mjs daemon/sip.mjs daemon/ami.mjs daemon/relay.mjs daemon/errors.mjs daemon/catalog.mjs daemon/plugin-errors.mjs daemon/audio.mjs daemon/audiosocket.mjs daemon/ws.mjs shared/g711.mjs shared/frame.mjs shared/jitter.mjs lib/errors.js lib/plugin-errors.js lib/plugin-skills.js lib/doctor.js; do node --check $f || exit 1; done && node test/run.mjs"
   },
   "engines": {
     "node": ">=22.5"
@@ -56,24 +59,26 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
-    "dsh-plugin",
     "dsh-better-sidebar",
+    "dsh-plugin",
     "phone",
+    "sip",
     "sms",
-    "voip",
+    "softphone",
+    "telegram",
     "twilio",
     "voicemail",
-    "webrtc",
-    "softphone"
+    "voip",
+    "webrtc"
   ],
   "author": {
-    "name": "Loukas \"Luca\" Tzekos",
+    "name": "Luca Tzekos",
     "url": "https://jobopportunitiesapi.org"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lucagiftzek/dsh-phone.git"
+    "url": "git+https://github.com/lucagiftzek/dsh-phone.git"
   },
   "homepage": "https://github.com/lucagiftzek/dsh-phone#readme",
   "bugs": {

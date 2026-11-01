@@ -1,0 +1,49 @@
+# /etc/systemd/system/dsh-telegramd.service  (template: replace YOUR_USER and the paths)
+# telegramd: the Telegram account of the DSH Phone tab (MTProto via gotd/td).
+# Listens on NO network port: only the private unix socket
+# ~/.dsh/phone/telegram/telegramd.sock (0600), used by phone-hookd.
+# The binary is built from telegramd/ and installed root-owned with its
+# sha256 next to it; the unit refuses to start a binary that does not match.
+[Unit]
+Description=dsh-phone telegramd: Telegram account for the DSH Phone tab (private unix socket only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+ExecStartPre=/usr/bin/sha256sum --quiet --check /usr/local/lib/dsh-phone/telegramd.sha256
+# Calls: libntgcalls (LGPL-3.0) next to the binary, pinned the same way. Remove this line for a build without calls.
+ExecStartPre=/usr/bin/sha256sum --quiet --check /usr/local/lib/dsh-phone/libntgcalls.sha256
+ExecStart=/usr/local/lib/dsh-phone/telegramd -dir /home/YOUR_USER/.dsh/phone/telegram
+Restart=on-failure
+RestartSec=5
+MemoryMax=768M
+MemorySwapMax=0
+TasksMax=256
+UMask=0077
+# Hardening: read-only system and home, writable only its own state dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOUR_USER/.dsh/phone/telegram
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

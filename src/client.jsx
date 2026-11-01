@@ -2,7 +2,9 @@
  * dsh-phone: browser half.
  *
  *   Phone service   one per page, started at apply(): live events (SSE), the
- *                   Twilio Voice Device (registered so calls can ring here),
+ *                   call audio route: "Via server" (default, src/server-audio.js:
+ *                   one wss socket to this origin, no third party) or "Direct"
+ *                   (the Twilio Voice Device, WebRTC straight to Twilio),
  *                   ringtone and chimes (WebAudio, no assets), browser
  *                   notifications. Do-not-disturb silences all of it.
  *   Overlay         a React root on document.body: incoming call, active call
@@ -16,6 +18,8 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { ServerCall } from './server-audio.js'
+import { createTelegramUI } from './telegram.jsx'
 
 const TAB_ID = 'dsh-phone:main'
 const API = '/dsh-phone/api'
@@ -42,6 +46,19 @@ async function apiPost(path, body) {
     method: 'POST', credentials: 'same-origin',
     headers: { 'content-type': 'application/json', accept: 'application/json', 'x-dsh-phone-token': tok },
     body: JSON.stringify(body || {}),
+  })
+  let r = await send(capToken || await mint())
+  if (r.status === 403) r = await send(await mint())
+  const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }))
+  if (!r.ok || j.ok === false) throw new Error(j.error || 'HTTP ' + r.status)
+  return j
+}
+/** Raw upload (a File or Blob) to a mutating route, same capability token as apiPost. */
+async function apiUpload(path, blob) {
+  const send = (tok) => fetch(API + path, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/octet-stream', accept: 'application/json', 'x-dsh-phone-token': tok },
+    body: blob,
   })
   let r = await send(capToken || await mint())
   if (r.status === 403) r = await send(await mint())
@@ -102,7 +119,15 @@ const S = {
   pendingPickup: null,
   notifPerm: typeof Notification === 'undefined' ? 'unsupported' : Notification.permission,
   sidebar: null,
+  route: 'server',     // effective call audio route: server | direct
+  routePref: '',       // this browser's choice ('' = the Settings default)
+  serverInfo: null,    // GET /audio/info, null = not available (yet)
+  routeNote: '',
+  test: null,          // running audio test (ServerCall)
+  testResult: null,
 }
+const ROUTE_KEY = 'dsh-phone:audio-route'
+try { S.routePref = localStorage.getItem(ROUTE_KEY) || '' } catch {}
 const subs = new Set()
 let tick = 0
 function changed() { tick++; for (const f of subs) { try { f(tick) } catch {} } }
@@ -120,7 +145,8 @@ async function refreshState() {
     const st = await apiGet('/state')
     S.st = st; S.stErr = ''; S.mode = st.mode; S.counts = st.counts
     changed()
-    if (st.ready && st.enabled && S.dev === 'off') void initDevice()
+    await chooseRoute()
+    if (st.ready && st.enabled && S.dev === 'off' && S.route === 'direct') void initDevice()
   } catch (e) { S.stErr = String(e.message || e); changed() }
   return S.st
 }
@@ -196,10 +222,10 @@ function openEvents() {
     toast({ kind: 'sms', title: label(m.peer, d.name), body: m.body || (m.media.length ? 'Attachment' : ''), peer: m.peer, line: m.line })
     notify('SMS from ' + label(m.peer, d.name), m.body || 'Attachment', 'sms-' + m.peer)
   })
-  on('call.incoming', () => bump('calls'))
-  on('call.update', () => { bump('calls'); refreshSoon() })
+  on('call.incoming', (d) => { bump('calls'); if (d.route === 'server' && d.ringing && d.call) onServerIncoming(d.call, d) })
+  on('call.update', (d) => { bump('calls'); refreshSoon(); clearServerIncoming(d.call) })
   on('call.ended', (d) => {
-    bump('calls'); refreshSoon()
+    bump('calls'); refreshSoon(); clearServerIncoming(d.call, true)
     for (const [id, l] of Object.entries(S.live)) if (l.vm.callSid === d.call.sid) delete S.live[id]
     changed()
   })
@@ -222,7 +248,74 @@ function openEvents() {
     toast({ kind: 'vm', title: 'Voicemail from ' + label(d.vm.peer, d.vm.name), body: d.vm.transcript || d.vm.liveText || fmtDur(d.vm.duration), ms: 10000 })
     notify('Voicemail from ' + label(d.vm.peer, d.vm.name), d.vm.transcript || 'New voicemail', 'vmr-' + d.vm.id)
   })
+  tgUI.wire(on)
   es.onerror = () => { /* EventSource reconnects by itself (retry: 3000) */ }
+}
+
+// ---------------------------------------------------------------- call audio route
+
+let routeChecked = 0
+/** Pick the effective route: the browser's choice, else Settings; server needs the plugin routes (dsh web restart). */
+async function chooseRoute(force = false) {
+  const want = S.routePref || (S.st && S.st.audio && S.st.audio.route) || 'server'
+  if (want === 'server' && (force || !S.serverInfo || Date.now() - routeChecked > 60000)) {
+    routeChecked = Date.now()
+    try {
+      const info = await apiGet('/audio/info')
+      S.serverInfo = info.upgrade === true ? info : null
+    } catch { S.serverInfo = null }
+  }
+  const prev = S.route
+  if (want === 'server' && S.serverInfo) { S.route = 'server'; S.routeNote = '' }
+  else if (want === 'server') { S.route = 'direct'; S.routeNote = 'Server audio is not available yet (it loads at the next dsh web restart): using Direct.' }
+  else { S.route = 'direct'; S.routeNote = '' }
+  if (S.route === 'server') {
+    if (device) { try { device.destroy() } catch {} device = null }
+    if (S.dev !== 'ready' || prev !== 'server') { S.dev = 'ready'; S.devErr = '' }
+    if (!presenceTimer) presenceTimer = setInterval(() => { void presence() }, 30000)
+    if (prev !== 'server' || force) void presence()
+  } else if (prev === 'server' && !device) { S.dev = 'off'; void presence() }
+  changed()
+}
+async function setRoute(r) {
+  S.routePref = r === 'direct' ? 'direct' : 'server'
+  try { localStorage.setItem(ROUTE_KEY, S.routePref) } catch {}
+  await chooseRoute(true)
+  if (S.route === 'direct' && S.st && S.st.ready && S.dev === 'off') void initDevice()
+}
+const audioDeps = () => ({ apiPost, socketPath: API + '/io', packetMs: (S.serverInfo && S.serverInfo.packetMs) || 40, jbMin: S.serverInfo && S.serverInfo.jitter && S.serverInfo.jitter.minMs, jbMax: S.serverInfo && S.serverInfo.jitter && S.serverInfo.jitter.maxMs })
+
+/** Local ringback while a server-routed outgoing call rings and no early media arrives. */
+let ringbackTimer = null
+function startRingback(call, line) {
+  if (ringbackTimer) return
+  const us = String(line && line.number || '').startsWith('+1')
+  const ring = () => { if (call.levels && call.levels.down > 0.02) return; if (us) tone([440, 480], 2, 0.05); else tone([425], 1, 0.05) }
+  ring(); ringbackTimer = setInterval(ring, us ? 6000 : 5000)
+}
+function stopRingback() { if (ringbackTimer) { clearInterval(ringbackTimer); ringbackTimer = null } }
+
+async function startServerCall(params, info) {
+  if (S.call) throw new Error('Hang up the current call first.')
+  if (S.test) S.test.disconnect()
+  const call = new ServerCall(params, audioDeps())
+  wireCall(call, { ...info, route: 'server' })
+  const lineObj = ((S.st && S.st.lines) || []).find(l => l.id === info.line)
+  call.on('ringing', () => { if (info.direction === 'out') startRingback(call, lineObj) })
+  call.on('accept', stopRingback)
+  call.on('disconnect', (why) => {
+    stopRingback()
+    const bad = { 'socket-closed': 'The audio connection to the server closed.', 'leg-failed': 'The server could not set up the call.', gone: 'The call has ended.', 'browser-lost': 'The audio connection was lost.' }[why]
+    if (bad) toast({ kind: 'err', title: 'Call ended', body: bad + (call.error ? ' ' + call.error : '') })
+  })
+  call.on('emojis', (e) => { if (S.call === call) { S.callInfo.emojis = e; changed() } })
+  call.on('reconnecting', () => { if (S.call === call) { S.callInfo.status = 'reconnecting'; changed() } })
+  call.on('resumed', () => { if (S.call === call) { S.callInfo.status = 'open'; changed() } })
+  try { await call.start() } catch (e) {
+    call.finish('start-failed')
+    throw e
+  }
+  return call
 }
 
 // ---------------------------------------------------------------- Twilio device
@@ -242,7 +335,7 @@ function loadSdk() {
 }
 async function fetchToken() { return (await apiPost('/token', {})).token }
 async function presence() {
-  try { await apiPost('/presence', { clientId: CLIENT_ID, registered: S.dev === 'ready' }) } catch {}
+  try { await apiPost('/presence', { clientId: CLIENT_ID, registered: S.dev === 'ready', audio: S.route === 'server' ? 'server' : 'direct' }) } catch {}
 }
 async function initDevice() {
   if (device || S.dev === 'loading') return
@@ -283,13 +376,13 @@ function callParams(call) {
 
 function wireCall(call, info) {
   S.call = call
-  S.callInfo = { ...info, status: info.direction === 'out' ? 'ringing' : 'connecting', startedAt: null, muted: false }
+  S.callInfo = { route: 'direct', ...info, status: info.direction === 'out' && info.route !== 'server' ? 'ringing' : 'connecting', startedAt: null, muted: false }
   const end = () => {
     if (S.call !== call) return
-    stopRing(); S.call = null; S.callInfo = null; changed(); bump('calls')
+    stopRing(); stopRingback(); S.call = null; S.callInfo = null; changed(); bump('calls')
   }
   call.on('accept', () => { if (S.call === call) { S.callInfo.status = 'open'; S.callInfo.startedAt = Date.now(); changed() } })
-  call.on('ringing', () => { if (S.call === call) { S.callInfo.status = 'ringing'; changed() } })
+  call.on('ringing', () => { if (S.call === call && S.callInfo.status !== 'open') { S.callInfo.status = 'ringing'; changed() } })
   call.on('mute', (m) => { if (S.call === call) { S.callInfo.muted = !!m; changed() } })
   call.on('disconnect', end); call.on('cancel', end); call.on('reject', end)
   call.on('error', (e) => { S.devErr = (e && e.message) || 'call error'; end() })
@@ -313,29 +406,67 @@ function onIncoming(call) {
   changed()
 }
 
+/** Server route: the call rings here through the event stream; the caller hears ringback from the server. */
+function onServerIncoming(call, d) {
+  if (S.route !== 'server') return
+  if (S.call || S.incoming) return // busy: unanswered, the call goes to voicemail
+  S.incoming = { server: true, callSid: call.sid, info: { peer: call.peer, name: call.name || '', line: call.line, direction: 'in' } }
+  if (!d.silent) startRing()
+  notify('Incoming call', label(call.peer, call.name), 'call')
+  changed()
+}
+function clearServerIncoming(call, ended) {
+  const inc = S.incoming
+  if (!inc || !inc.server || !call || call.sid !== inc.callSid) return
+  if (!ended && call.disposition === 'ringing') return
+  S.incoming = null; stopRing(); changed()
+}
+
 const phone = {
   accept() {
     const inc = S.incoming; if (!inc) return
     S.incoming = null; stopRing()
+    if (inc.server) {
+      startServerCall({ purpose: 'answer', callSid: inc.callSid }, inc.info).catch(e => { toast({ kind: 'err', title: 'Could not answer', body: e.message }); changed() })
+      return
+    }
     wireCall(inc.call, inc.info)
     inc.call.accept()
   },
-  decline() { const inc = S.incoming; if (!inc) return; S.incoming = null; stopRing(); inc.call.reject(); changed() },
+  decline() {
+    const inc = S.incoming; if (!inc) return; S.incoming = null; stopRing()
+    if (inc.server) apiPost('/audio/decline', { callSid: inc.callSid }).catch(() => {})
+    else inc.call.reject()
+    changed()
+  },
   async declineWithText(text) {
     const inc = S.incoming; if (!inc) return
     phone.decline()
+    if (inc.info.line === 'tg') { try { await apiPost('/tg/send', { chat: Number(inc.info.peer), text }) } catch (e) { toast({ kind: 'err', title: 'Telegram message not sent', body: e.message }) } return }
     try { await apiPost('/sms/send', { to: inc.info.peer, body: text, line: inc.info.line }) } catch (e) { toast({ kind: 'err', title: 'SMS not sent', body: e.message }) }
   },
   hangup() { if (S.call) { try { S.call.disconnect() } catch {} } },
   mute() { if (S.call) { S.call.mute(!S.call.isMuted()) } },
   digit(d) { if (S.call) { try { S.call.sendDigits(d) } catch {} tone([697 + '123456789*0#'.indexOf(d) * 20], 0.08, 0.04) } },
-  async dial(to, line) {
+  async dial(to, line, name = '') {
+    if (line === 'tg' && S.route !== 'server') throw new Error('Telegram calls need the server audio route (Setup, Call audio).')
+    if (S.route === 'server') { await startServerCall({ purpose: 'dial', to, line: line || '' }, { peer: to, name, line, direction: 'out' }); return }
     if (!device || S.dev !== 'ready') throw new Error('The phone is not connected yet (' + (S.devErr || S.dev) + ').')
     if (S.call) throw new Error('Hang up the current call first.')
     const call = await device.connect({ params: { To: to, line: line || '' } })
     wireCall(call, { peer: to, name: '', line, direction: 'out' })
   },
   async pickup(vmId) {
+    if (S.route === 'server') {
+      const l = S.live[vmId]
+      if (l) l.picking = true
+      changed()
+      try { await startServerCall({ purpose: 'pickup', vmId }, { peer: l ? l.vm.peer : '', name: l ? l.vm.name : '', line: l ? l.vm.line : '', direction: 'in' }) } catch (e) {
+        if (S.live[vmId]) S.live[vmId].picking = false
+        toast({ kind: 'err', title: 'Could not pick up', body: e.message }); changed()
+      }
+      return
+    }
     const token = Math.random().toString(36).slice(2, 14).replace(/[^a-z0-9]/g, '')
     S.pendingPickup = token
     if (S.live[vmId]) S.live[vmId].picking = true
@@ -345,6 +476,23 @@ const phone = {
       toast({ kind: 'err', title: 'Could not pick up', body: e.message }); changed()
     }
   },
+  /** "Test audio": loopback through the server, no call, no cost. */
+  async testAudio() {
+    if (S.test) { S.test.disconnect(); return }
+    if (S.call) { toast({ kind: 'err', title: 'Test audio', body: 'Hang up the call first.' }); return }
+    S.testResult = null
+    const t = new ServerCall({ purpose: 'test' }, audioDeps())
+    S.test = t
+    t.on('state', changed); t.on('levels', changed); t.on('stats', changed)
+    t.on('disconnect', (why) => {
+      const snap = t.snapshot()
+      S.testResult = { ok: snap.counters.downPackets > 0 && snap.counters.upPackets > 0, why, snap }
+      S.test = null; changed()
+    })
+    changed()
+    try { await t.start() } catch (e) { S.test = null; S.testResult = { ok: false, why: e.message, snap: null }; changed() }
+  },
+  setRoute(r) { void setRoute(r) },
   dismissLive(vmId) { if (S.live[vmId]) { S.live[vmId].dismissed = true; changed() } },
   async setMode(mode) {
     const prev = S.mode
@@ -487,6 +635,9 @@ const initials = (peer, name) => {
   return String(peer || '?').replace(/\D/g, '').slice(-2) || '#'
 }
 
+// Telegram (src/telegram.jsx): its own tab view, Setup section and live events.
+const tgUI = createTelegramUI({ API, apiGet, apiPost, apiUpload, usePhone, S, bump, changed, toast, notify, ping, I, fmtWhen, fmtDur, dial: (to, line, name) => phone.dial(to, line, name), accept: (callSid) => { if (S.incoming && S.incoming.server && S.incoming.callSid === callSid) phone.accept() } })
+
 // ---------------------------------------------------------------- overlay
 
 function CallTimer({ since }) {
@@ -509,6 +660,26 @@ function Keypad({ onKey, compact }) {
   )
 }
 
+function Bar({ v, title }) {
+  const w = Math.max(2, Math.min(100, Math.round(Math.sqrt(Math.max(0, v || 0)) * 140)))
+  return <span title={title} style={{ display: 'inline-block', width: 54, height: 6, borderRadius: 3, background: 'var(--line)', overflow: 'hidden', verticalAlign: 'middle' }}><span style={{ display: 'block', width: w + '%', height: '100%', background: 'var(--ok)' }} /></span>
+}
+/** Route + live audio both ways (levels, packets, jitter, round trip) for a server-routed call or test. */
+function AudioMeter({ call }) {
+  const [, set] = useState(0)
+  useEffect(() => { const t = setInterval(() => set(x => x + 1), 250); return () => clearInterval(t) }, [])
+  if (!call || typeof call.snapshot !== 'function') return null
+  const s = call.snapshot()
+  const leg = s.leg === 'asterisk' ? 'SIP relay' : s.leg === 'twilio' ? 'Twilio stream' : s.leg === 'echo' ? 'echo' : ''
+  return (
+    <div className="phx-s phx-mono" style={{ margin: '0 0 8px', lineHeight: 1.6 }}>
+      <div>via server{leg ? ' · ' + leg : ''}{s.rttMs !== null ? ' · rtt ' + s.rttMs + ' ms' : ''}{s.jb ? ' · buffer ' + s.jb.targetMs + ' ms' : ''}</div>
+      <div><span style={{ display: 'inline-block', width: 30 }}>you</span><Bar v={s.levels.up} title="Your microphone" /> {s.counters.upPackets} pkts</div>
+      <div><span style={{ display: 'inline-block', width: 30 }}>them</span><Bar v={s.levels.down} title="Far end" /> {s.counters.downPackets} pkts{s.jb && s.jb.underruns ? ' · ' + s.jb.underruns + ' gaps' : ''}</div>
+    </div>
+  )
+}
+
 function ActiveCallCard() {
   const p = usePhone()
   const [pad, setPad] = useState(false)
@@ -517,10 +688,12 @@ function ActiveCallCard() {
   return (
     <div className="phx-oc" role="dialog" aria-label="Active call">
       <div className="phx-flex" style={{ justifyContent: 'space-between' }}>
-        <span className="phx-k">{c.direction === 'out' ? 'Outgoing call' : 'Call'}{c.line ? ' · ' + c.line : ''}</span>
-        <span className="phx-s">{c.status === 'open' ? <CallTimer since={c.startedAt} /> : c.status === 'ringing' ? 'Ringing...' : 'Connecting...'}</span>
+        <span className="phx-k">{c.direction === 'out' ? 'Outgoing call' : 'Call'}{c.line === 'tg' ? ' · Telegram' : c.line ? ' · ' + c.line : ''}</span>
+        <span className="phx-s">{c.status === 'open' ? <CallTimer since={c.startedAt} /> : c.status === 'ringing' ? 'Ringing...' : c.status === 'reconnecting' ? 'Reconnecting...' : 'Connecting...'}</span>
       </div>
-      <div className="phx-big" style={{ margin: '6px 0 10px' }}>{label(c.peer, c.name)}</div>
+      <div className="phx-big" style={{ margin: '6px 0 4px' }}>{label(c.peer, c.name)}</div>
+      {c.emojis ? <div className="phx-s" title="Encryption key: the same four emoji appear on the other phone" style={{ marginBottom: 6, fontSize: 18, letterSpacing: 4 }}>{c.emojis}</div> : null}
+      {c.route === 'server' ? <AudioMeter call={p.call} /> : <div className="phx-s" style={{ marginBottom: 8 }}>Audio: direct (WebRTC to Twilio)</div>}
       {pad ? <Keypad compact onKey={phone.digit} /> : null}
       <div className="phx-flex" style={{ justifyContent: 'space-between', marginTop: 6 }}>
         <div className="phx-flex">
@@ -541,7 +714,7 @@ function IncomingCard() {
   const quick = ['Cannot talk right now. I will call you back.', 'In a meeting, text me?', 'Call you in 10 minutes.']
   return (
     <div className="phx-oc ring" role="alertdialog" aria-label="Incoming call">
-      <div className="phx-k">Incoming call{c.line ? ' · line ' + c.line : ''}</div>
+      <div className="phx-k">Incoming {c.line === 'tg' ? 'Telegram call' : 'call'}{c.line && c.line !== 'tg' ? ' · line ' + c.line : ''}</div>
       <div className="phx-big" style={{ margin: '6px 0 2px' }}>{label(c.peer, c.name)}</div>
       {c.name ? <div className="phx-s phx-mono">{fmtNum(c.peer)}</div> : null}
       {reply ? (
@@ -574,7 +747,7 @@ function LiveVoicemailCards() {
       <div className="phx-big" style={{ marginTop: 6 }}>{label(l.vm.peer, l.vm.name)}</div>
       <div className="phx-live" ref={el => { ref.current[id] = el }}>{l.text}</div>
       <div className="phx-flex" style={{ justifyContent: 'space-between' }}>
-        <span className="phx-s">{p.dev === 'ready' ? 'Pick up to take the call here.' : 'Phone not connected: cannot pick up.'}</span>
+        <span className="phx-s">{p.dev === 'ready' ? 'Pick up to take the call here' + (p.route === 'server' ? ' (via server).' : '.') : 'Phone not connected: cannot pick up.'}</span>
         <button type="button" className="phx-btn ok" disabled={p.dev !== 'ready' || !!p.call || l.picking} onClick={() => phone.pickup(Number(id))}>{I.phone(14)}{l.picking ? 'Connecting...' : 'Pick up'}</button>
       </div>
     </div>
@@ -585,8 +758,8 @@ function Toasts() {
   const p = usePhone()
   return p.toasts.map(t => (
     <div key={t.id} className={'phx-toast' + (t.kind === 'err' ? ' err' : '')} role="status"
-      onClick={() => { S.toasts = S.toasts.filter(x => x.id !== t.id); changed(); if (t.kind !== 'err') { if (t.peer) S.openThread = { peer: t.peer, line: t.line }; openTab(); changed() } }}>
-      <div className="phx-flex" style={{ gap: 6 }}>{t.kind === 'sms' ? I.msg(13) : t.kind === 'vm' ? I.vm(13) : null}<b className="phx-grow">{t.title}</b></div>
+      onClick={() => { S.toasts = S.toasts.filter(x => x.id !== t.id); changed(); if (t.kind !== 'err') { if (t.peer) S.openThread = { peer: t.peer, line: t.line }; if (t.tgChat) S.tgOpenRequest = t.tgChat; openTab(); changed() } }}>
+      <div className="phx-flex" style={{ gap: 6 }}>{t.kind === 'sms' ? I.msg(13) : t.kind === 'vm' ? I.vm(13) : t.kind === 'tg' ? tgUI.icon(13) : null}<b className="phx-grow">{t.title}</b></div>
       {t.body ? <div className="b">{t.body}</div> : null}
     </div>
   ))
@@ -612,7 +785,7 @@ function StatusDot() {
   let cls = '', text = 'Loading'
   if (p.stErr) { cls = 'bad'; text = 'Phone service unreachable' }
   else if (st && !st.ready) { cls = 'warn'; text = 'Setup needed' }
-  else if (p.dev === 'ready') { cls = 'ok'; text = 'Connected' }
+  else if (p.dev === 'ready') { cls = 'ok'; text = p.route === 'server' ? 'Connected (via server)' : 'Connected (direct)' }
   else if (p.dev === 'loading') { cls = 'warn'; text = 'Connecting' }
   else if (p.dev === 'error') { cls = 'bad'; text = 'Device error' }
   else if (p.dev === 'offline') { cls = 'warn'; text = 'Offline' }
@@ -895,6 +1068,37 @@ function Dialer({ preset }) {
       {p.dev !== 'ready' ? <div className="phx-s" style={{ textAlign: 'center', marginTop: 8 }}>{p.devErr || 'The phone is connecting...'}</div> : null}
       {err ? <div className="phx-note bad" style={{ marginTop: 10 }}>{err}</div> : null}
       <div className="phx-s" style={{ textAlign: 'center', marginTop: 12 }}>Calls go out from {(() => { const l = ((p.st && p.st.lines) || []).find(x => x.id === line); return l ? fmtNum(l.number) : 'the default line' })()}. The first call asks for microphone access.</div>
+      <AudioRoute />
+    </div>
+  )
+}
+
+function AudioRoute() {
+  const p = usePhone()
+  const pref = p.routePref || (p.st && p.st.audio && p.st.audio.route) || 'server'
+  const r = p.testResult
+  return (
+    <div style={{ marginTop: 14, borderTop: '1px solid var(--line)', paddingTop: 10 }}>
+      <div className="phx-flex" style={{ justifyContent: 'space-between' }}>
+        <span className="phx-k">Call audio</span>
+        <div className="phx-seg" role="group" aria-label="Call audio route" style={{ maxWidth: 220 }}>
+          <button type="button" aria-pressed={pref === 'server'} title="Audio goes through this server over one encrypted socket. Works on networks that block WebRTC." onClick={() => phone.setRoute('server')}>Via server</button>
+          <button type="button" aria-pressed={pref === 'direct'} title="WebRTC from this browser straight to Twilio." onClick={() => phone.setRoute('direct')}>Direct</button>
+        </div>
+      </div>
+      {p.routeNote ? <div className="phx-note warn" style={{ marginTop: 8 }}>{p.routeNote}</div> : null}
+      {p.route === 'server' ? (
+        <div style={{ marginTop: 8 }}>
+          <div className="phx-flex" style={{ justifyContent: 'space-between' }}>
+            <span className="phx-s">Check this network first: speak and hear yourself back through the server. No call, no cost.</span>
+            <button type="button" className="phx-btn" disabled={!!p.call} onClick={() => void phone.testAudio()}>{p.test ? 'Stop test' : 'Test audio'}</button>
+          </div>
+          {p.test ? <div style={{ marginTop: 6 }}><AudioMeter call={p.test} /></div> : null}
+          {r ? <div className={'phx-note ' + (r.ok ? 'ok' : 'bad')} style={{ marginTop: 6 }}>{r.ok
+            ? 'Audio works both ways: ' + r.snap.counters.upPackets + ' packets sent, ' + r.snap.counters.downPackets + ' received' + (r.snap.rttMs !== null ? ', round trip ' + r.snap.rttMs + ' ms' : '') + '.'
+            : 'The test failed: ' + (r.why || 'no audio came back') + '.'}</div> : null}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -994,6 +1198,11 @@ function Checklist() {
         {row(check.apiKey && check.apiKey.ok, 'API key (browser calls)', check.apiKey ? (check.apiKey.name || check.apiKey.error || 'missing') : '')}
         {row(check.app && check.app.ok, 'TwiML App (outgoing calls)', check.app ? (check.app.ok ? 'ok' : check.app.error || 'missing or stale') : '')}
         {(check.lines || []).map(l => row(l.ok, 'Line ' + l.id + ' ' + fmtNum(l.number), l.ok ? 'webhooks ok' : (l.error || 'webhooks not applied')))}
+        {check.sip ? <>
+          {row(check.sip.domain && check.sip.domain.ok, 'SIP Domain (relay bridge)', check.sip.domain ? (check.sip.domain.ok ? check.sip.domain.name : (check.sip.domain.error || 'Voice URL or registration not applied')) : '')}
+          {row(check.sip.credentials && check.sip.credentials.ok && check.sip.mappings && check.sip.mappings.ok, 'SIP credentials + auth mappings', check.sip.credentials && check.sip.credentials.ok && check.sip.mappings && check.sip.mappings.ok ? 'user ' + check.sip.credentials.user : ((check.sip.credentials && check.sip.credentials.error) || (check.sip.mappings && check.sip.mappings.error) || 'run Apply'))}
+        </> : null}
+        {check.relay ? row(check.relay.ok, 'Relay registrations', (check.relay.registrations || []).map(r => r.name.replace(/^dshp-|-reg$/g, '') + ': ' + r.status).join(', ') || check.relay.error || 'none') : null}
         {row(check.publicHook && check.publicHook.ok, 'Public webhook endpoint', check.publicHook ? (check.publicHook.ok ? st.publicBaseUrl : (check.publicHook.error || 'HTTP ' + check.publicHook.status)) : '')}
       </> : <div className="phx-s">{busy ? 'Checking...' : 'Not checked yet.'}</div>}
       {row(p.dev === 'ready', 'This browser', p.dev === 'ready' ? 'registered, calls can ring here' : (p.devErr || p.dev))}
@@ -1002,6 +1211,77 @@ function Checklist() {
       {result ? <div className={'phx-note ' + (result.ok ? 'ok' : 'bad')} style={{ marginTop: 8 }}>{result.report.map(r => <div key={r.name}>{r.ok ? 'OK' : 'FAILED'} · {r.name}: {r.detail}</div>)}</div> : null}
       {p.dev !== 'ready' && st.ready ? <button type="button" className="phx-btn" style={{ marginTop: 8 }} onClick={() => void restartDevice()}>Reconnect this browser</button> : null}
     </div>
+  )
+}
+
+const SIP_CODECS = ['alaw', 'ulaw', 'g722', 'opus', 'g729', 'gsm']
+const listText = (a) => (Array.isArray(a) ? a.join(', ') : '')
+const textList = (t) => String(t || '').split(/[\s,]+/).map(x => x.trim()).filter(Boolean)
+
+/** Settings > Phone > SIP accounts: landlines and VoIP numbers behind the Asterisk relay. */
+function SipAccounts({ form, set, lines }) {
+  const accts = form.sipAccounts || []
+  const relay = form.relay || {}
+  const st = usePhone().st || {}
+  const status = Object.fromEntries((st.sipAccounts || []).map(a => [a.id, a]))
+  const setA = (i, k, v) => { const xs = structuredClone(accts); xs[i][k] = v; set('sipAccounts', xs) }
+  const setR = (k, v) => set('relay', { ...relay, [k]: v })
+  const twilioLines = lines.filter(l => l.provider === 'twilio')
+  const sipLines = lines.filter(l => l.provider === 'sip')
+  const add = () => set('sipAccounts', [...accts, { id: 'sip' + (accts.length + 1), label: '', enabled: true, line: (sipLines[0] || {}).id || '', registrar: '', port: 0, transport: 'udp', username: '', authUser: '', password: '', fromDomain: '', outboundProxy: '', expiry: 300, keepalive: 30, did: '', callerId: '', country: '', codecs: ['alaw', 'ulaw'], dtmf: 'rfc4733', srtp: 'off', mode: 'bridge', bridgeVia: (twilioLines[0] || {}).id || '', ringFirstSeconds: 0, dialFormat: 'national', allowPrefixes: [], blockPrefixes: [], identifyIps: [], credentialsFile: '' }])
+  return (
+    <>
+      <div className="phx-h">SIP accounts</div>
+      <div className="phx-note info">A landline or VoIP number that registers through the Asterisk relay on this server. Bridge mode sends its calls through a Twilio line's SIP Domain, so it gets the browser phone, voicemail and live transcript. Give it a line with provider SIP, then run Apply to Twilio. Empty fields are read from the credentials file.</div>
+      {accts.map((a, i) => {
+        const s = status[a.id]
+        return (
+          <div key={i} className="phx-card" style={{ padding: 9 }}>
+            <div className="phx-linerow">
+              <input className="phx-in phx-mono" title="Account id" placeholder="id" value={a.id} onChange={e => setA(i, 'id', e.target.value)} />
+              <input className="phx-in" title="Label" placeholder="Label" value={a.label} onChange={e => setA(i, 'label', e.target.value)} />
+              <select className="phx-in" title="Line it rings" value={a.line} onChange={e => setA(i, 'line', e.target.value)}><option value="">line...</option>{sipLines.map(l => <option key={l.id} value={l.id}>{l.id} {l.number}</option>)}</select>
+              <button type="button" className="phx-btn i d" title="Remove account" onClick={() => set('sipAccounts', accts.filter((_, j) => j !== i))}>&#x2715;</button>
+            </div>
+            {s && s.issues && s.issues.length ? <div className="phx-note bad">{s.issues.join('. ')}</div> : null}
+            {s && s.warnings && s.warnings.length ? <div className="phx-note warn">{s.warnings.join('. ')}</div> : null}
+            <div className="phx-grid">
+              <Field label="Credentials file" hint="KEY=value: <PREFIX>SIP_REGISTRAR, SIP_PORT, SIP_USERNAME, SIP_PASSWORD, DID"><input className="phx-in phx-mono" value={a.credentialsFile} onChange={e => setA(i, 'credentialsFile', e.target.value)} /></Field>
+              <Field label="Registrar"><input className="phx-in phx-mono" placeholder="from file" value={a.registrar} onChange={e => setA(i, 'registrar', e.target.value)} /></Field>
+              <Field label="Port / transport"><div className="phx-flex" style={{ flexWrap: 'nowrap' }}><input className="phx-in" type="number" placeholder="5060" value={a.port || ''} onChange={e => setA(i, 'port', Number(e.target.value))} /><select className="phx-in" value={a.transport} onChange={e => setA(i, 'transport', e.target.value)}><option value="udp">UDP</option><option value="tcp">TCP</option><option value="tls">TLS</option></select></div></Field>
+              <Field label="Username"><input className="phx-in phx-mono" placeholder="from file" value={a.username} onChange={e => setA(i, 'username', e.target.value)} /></Field>
+              <Field label="Auth username" hint="Only if different"><input className="phx-in phx-mono" value={a.authUser} onChange={e => setA(i, 'authUser', e.target.value)} /></Field>
+              <Field label="Password"><Secret value={a.password} onChange={v => setA(i, 'password', v)} placeholder="from file" /></Field>
+              <Field label="From domain"><input className="phx-in phx-mono" value={a.fromDomain} onChange={e => setA(i, 'fromDomain', e.target.value)} /></Field>
+              <Field label="Outbound proxy"><input className="phx-in phx-mono" value={a.outboundProxy} onChange={e => setA(i, 'outboundProxy', e.target.value)} /></Field>
+              <Field label="Registration expiry / keepalive (s)"><div className="phx-flex" style={{ flexWrap: 'nowrap' }}><input className="phx-in" type="number" value={a.expiry} onChange={e => setA(i, 'expiry', Number(e.target.value))} /><input className="phx-in" type="number" value={a.keepalive} onChange={e => setA(i, 'keepalive', Number(e.target.value))} /></div></Field>
+              <Field label="DID / caller ID"><div className="phx-flex" style={{ flexWrap: 'nowrap' }}><input className="phx-in phx-mono" placeholder="from file" value={a.did} onChange={e => setA(i, 'did', e.target.value)} /><input className="phx-in phx-mono" placeholder="caller ID" value={a.callerId} onChange={e => setA(i, 'callerId', e.target.value)} /></div></Field>
+              <Field label="Codecs (in order)"><input className="phx-in phx-mono" list="phx-codecs" value={listText(a.codecs)} onChange={e => setA(i, 'codecs', textList(e.target.value))} /><datalist id="phx-codecs">{SIP_CODECS.map(c => <option key={c} value={c} />)}</datalist></Field>
+              <Field label="DTMF / SRTP"><div className="phx-flex" style={{ flexWrap: 'nowrap' }}><select className="phx-in" value={a.dtmf} onChange={e => setA(i, 'dtmf', e.target.value)}><option value="rfc4733">RFC 4733</option><option value="info">SIP INFO</option><option value="inband">In-band</option><option value="auto">Auto</option></select><select className="phx-in" value={a.srtp} onChange={e => setA(i, 'srtp', e.target.value)}><option value="off">SRTP off</option><option value="sdes">SDES if offered</option><option value="required">SDES required</option></select></div></Field>
+              <Field label="Mode"><select className="phx-in" value={a.mode} onChange={e => setA(i, 'mode', e.target.value)}><option value="bridge">Bridge into a Twilio line</option><option value="direct" disabled>Direct WebRTC (planned)</option></select></Field>
+              <Field label="Bridge via"><select className="phx-in" value={a.bridgeVia} onChange={e => setA(i, 'bridgeVia', e.target.value)}><option value="">line...</option>{twilioLines.map(l => <option key={l.id} value={l.id}>{l.id} {l.number}</option>)}</select></Field>
+              <Field label="Ring other phones first (s)" hint="Voicemail here answers after this, so a desk or router phone on the same account can ring. 0 = at once"><input className="phx-in" type="number" min={0} max={60} value={a.ringFirstSeconds} onChange={e => setA(i, 'ringFirstSeconds', Number(e.target.value))} /></Field>
+              <Field label="Dial format"><select className="phx-in" value={a.dialFormat} onChange={e => setA(i, 'dialFormat', e.target.value)}><option value="national">National (00 for abroad)</option><option value="e164">E.164 (+...)</option><option value="intl00">Always 00...</option></select></Field>
+              <Field label="Allowed prefixes" hint="Outgoing calls only to these, e.g. +30. Empty = the account's country"><input className="phx-in phx-mono" value={listText(a.allowPrefixes)} onChange={e => setA(i, 'allowPrefixes', textList(e.target.value))} /></Field>
+              <Field label="Blocked prefixes" hint="e.g. premium numbers +3090"><input className="phx-in phx-mono" value={listText(a.blockPrefixes)} onChange={e => setA(i, 'blockPrefixes', textList(e.target.value))} /></Field>
+              <Field label="Extra provider IPs" hint="Besides the registrar, for incoming calls"><input className="phx-in phx-mono" value={listText(a.identifyIps)} onChange={e => setA(i, 'identifyIps', textList(e.target.value))} /></Field>
+            </div>
+            <Check checked={a.enabled} onChange={v => setA(i, 'enabled', v)}>Registered (off: the relay drops this account)</Check>
+          </div>
+        )
+      })}
+      <div className="phx-flex" style={{ marginBottom: 6 }}><button type="button" className="phx-btn" onClick={add}>Add SIP account</button></div>
+      <div className="phx-h">Relay (Asterisk on this server)</div>
+      <div className="phx-grid">
+        <Field label="Bind address" hint="The LAN address, never 0.0.0.0"><input className="phx-in phx-mono" value={relay.bindAddress || ''} onChange={e => setR('bindAddress', e.target.value)} /></Field>
+        <Field label="SIP port"><input className="phx-in" type="number" value={relay.bindPort || 5070} onChange={e => setR('bindPort', Number(e.target.value))} /></Field>
+        <Field label="Public media address" hint="Behind NAT: the public IP or a hostname that resolves to it"><input className="phx-in phx-mono" value={relay.externalMediaAddress || ''} onChange={e => setR('externalMediaAddress', e.target.value)} /></Field>
+        <Field label="Local networks"><input className="phx-in phx-mono" placeholder="your LAN as CIDR" value={listText(relay.localNets)} onChange={e => setR('localNets', textList(e.target.value))} /></Field>
+        <Field label="Twilio SIP edge" hint="Where the relay registers, e.g. dublin"><input className="phx-in phx-mono" value={(form.twilio && form.twilio.sipEdge) || ''} onChange={e => set('twilio.sipEdge', e.target.value)} /></Field>
+        <Field label="Bridge transport" hint="TLS: port 5061 with SRTP, and router SIP ALG helpers cannot touch the call"><select className="phx-in" value={relay.bridgeTransport || 'udp'} onChange={e => setR('bridgeTransport', e.target.value)}><option value="tls">TLS + SRTP</option><option value="udp">UDP + RTP</option></select></Field>
+        <Field label="Include directory"><input className="phx-in phx-mono" value={relay.configDir || ''} onChange={e => setR('configDir', e.target.value)} /></Field>
+      </div>
+    </>
   )
 }
 
@@ -1054,7 +1334,7 @@ function Setup({ embedded }) {
             <button type="button" className="phx-btn i d" title="Remove line" onClick={() => set('lines', lines.filter((_, j) => j !== i))}>&#x2715;</button>
           </div>
           <div className="phx-flex">
-            <select className="phx-in" style={{ width: 'auto' }} value={l.provider} onChange={e => setLine(i, 'provider', e.target.value)}><option value="twilio">Twilio</option><option value="sip">SIP (coming next)</option></select>
+            <select className="phx-in" style={{ width: 'auto' }} value={l.provider} onChange={e => setLine(i, 'provider', e.target.value)}><option value="twilio">Twilio</option><option value="sip">SIP (relay)</option></select>
             <input className="phx-in phx-mono" style={{ flex: 1, minWidth: 140 }} placeholder="Number SID (PN..., optional)" value={l.numberSid} onChange={e => setLine(i, 'numberSid', e.target.value)} />
             <Check checked={l.sms} onChange={v => setLine(i, 'sms', v)}>SMS</Check>
             <Check checked={l.voice} onChange={v => setLine(i, 'voice', v)}>Voice</Check>
@@ -1132,17 +1412,9 @@ function Setup({ embedded }) {
       <Check checked={form.agent.allowCalls} onChange={v => set('agent.allowCalls', v)}>Agents may place spoken alert calls (draft first, then confirm)</Check>
       <Check checked={form.agent.allowModeChange} onChange={v => set('agent.allowModeChange', v)}>Agents may switch Live / Voicemail / Do not disturb</Check>
 
-      <div className="phx-h">SIP line <span className="phx-pill" style={{ color: 'var(--ink3)' }}>next</span></div>
-      <div className="phx-note info">A second line from a SIP provider (for example Yuboto) through a relay on this server. The fields are stored now; the relay is not wired yet.</div>
-      <Check checked={form.sip.enabled} onChange={v => set('sip.enabled', v)}>Enable SIP line</Check>
-      <div className="phx-grid">
-        <Field label="Label"><input className="phx-in" {...T('sip.label')} /></Field>
-        <Field label="Number"><input className="phx-in phx-mono" {...T('sip.number')} /></Field>
-        <Field label="Registrar / host"><input className="phx-in phx-mono" {...T('sip.registrar')} /></Field>
-        <Field label="Username"><input className="phx-in phx-mono" {...T('sip.username')} /></Field>
-        <Field label="Password"><Secret value={form.sip.password} onChange={v => set('sip.password', v)} /></Field>
-        <Field label="WebSocket (WSS) URL"><input className="phx-in phx-mono" {...T('sip.wssUrl')} /></Field>
-      </div>
+      <SipAccounts form={form} set={set} lines={lines} />
+
+      <tgUI.Setup />
 
       <div style={{ position: 'sticky', bottom: 0, padding: '10px 0', background: 'var(--bg)', borderTop: '1px solid var(--line)', marginTop: 10 }}>
         <div className="phx-flex">
@@ -1167,6 +1439,7 @@ function PhoneView({ visible }) {
   useEffect(() => { if (visible) void refreshState() }, [visible])
   useEffect(() => {
     if (S.openThread) { setThread(S.openThread); setView('messages'); S.openThread = null }
+    if (S.tgOpenRequest) setView('telegram')
   }, [p.toasts.length, visible])
 
   const callTo = (peer, line) => { setPreset({ peer, line, at: Date.now() }); setView('keypad'); phone.dial(peer, line).catch(e => toast({ kind: 'err', title: 'Call failed', body: e.message })) }
@@ -1175,6 +1448,7 @@ function PhoneView({ visible }) {
   const st = p.st
   const tabs = [
     ['messages', 'Messages', I.msg(13), p.counts.sms, ''],
+    ['telegram', 'Telegram', tgUI.icon(13), (p.tg && p.tg.counts.unread) || 0, ''],
     ['calls', 'Calls', I.phone(13), p.counts.missed, 'bad'],
     ['voicemail', 'Voicemail', I.vm(13), p.counts.voicemail, ''],
     ['keypad', 'Keypad', I.pad(12), 0, ''],
@@ -1183,6 +1457,7 @@ function PhoneView({ visible }) {
   const needsSetup = st && !st.ready
   let body
   if (view === 'setup') body = <Setup />
+  else if (view === 'telegram') body = <tgUI.View />
   else if (needsSetup && view !== 'setup') {
     body = (
       <div className="phx-body">
@@ -1245,6 +1520,7 @@ function boot() {
   const wake = () => { if (actx && actx.state === 'suspended') actx.resume().catch(() => {}) }
   document.addEventListener('pointerdown', wake, { capture: true, passive: true })
   void refreshState().then((st) => { if (st && st.enabled) openEvents() })
+  void tgUI.refreshTg()
   return () => {
     document.removeEventListener('pointerdown', wake, { capture: true })
     stopRing()
@@ -1271,7 +1547,7 @@ export function apply(ctx) {
       order: 92,
       single: true,
       icon: tabIcon,
-      badge: () => { const n = (S.counts.sms || 0) + (S.counts.voicemail || 0) + (S.counts.missed || 0); return n > 0 ? n : null },
+      badge: () => { const n = (S.counts.sms || 0) + (S.counts.voicemail || 0) + (S.counts.missed || 0) + ((S.tg && S.tg.counts.unread) || 0); return n > 0 ? n : null },
       component: (props) => <PhoneView visible={props.visible !== false} />,
     }), 'dsh-phone: register the Phone sidebar tab')
   } else {

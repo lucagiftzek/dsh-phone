@@ -33,7 +33,7 @@ t('validateSignature tolerates an explicit :443', () => {
 })
 
 t('voice access token is a valid HS256 JWT with the grant', () => {
-  const tok = voiceAccessToken({ accountSid: 'ACx', apiKeySid: 'SKy', apiKeySecret: 'shh', identity: 'luca', appSid: 'APz', ttl: 600, now: 1_700_000_000_000 })
+  const tok = voiceAccessToken({ accountSid: 'ACx', apiKeySid: 'SKy', apiKeySecret: 'shh', identity: 'owner', appSid: 'APz', ttl: 600, now: 1_700_000_000_000 })
   const [h, p, s] = tok.split('.')
   const want = createHmac('sha256', 'shh').update(h + '.' + p).digest('base64url')
   assert.equal(s, want)
@@ -42,12 +42,12 @@ t('voice access token is a valid HS256 JWT with the grant', () => {
   assert.equal(header.cty, 'twilio-fpa;v=1')
   assert.equal(payload.iss, 'SKy'); assert.equal(payload.sub, 'ACx')
   assert.equal(payload.exp - payload.iat, 600)
-  assert.deepEqual(payload.grants, { identity: 'luca', voice: { incoming: { allow: true }, outgoing: { application_sid: 'APz' } } })
+  assert.deepEqual(payload.grants, { identity: 'owner', voice: { incoming: { allow: true }, outgoing: { application_sid: 'APz' } } })
 })
 
 t('TwiML builder escapes text and attributes', () => {
-  const x = twiml(el('Say', { voice: 'Polly.Joanna-Neural', language: '' }, 'a < b & "c"'), el('Dial', { timeout: 20, answerOnBridge: true }, [el('Client', {}, [el('Identity', {}, 'luca')])]))
-  assert.equal(x, '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna-Neural">a &lt; b &amp; &quot;c&quot;</Say><Dial timeout="20" answerOnBridge="true"><Client><Identity>luca</Identity></Client></Dial></Response>')
+  const x = twiml(el('Say', { voice: 'Polly.Joanna-Neural', language: '' }, 'a < b & "c"'), el('Dial', { timeout: 20, answerOnBridge: true }, [el('Client', {}, [el('Identity', {}, 'owner')])]))
+  assert.equal(x, '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna-Neural">a &lt; b &amp; &quot;c&quot;</Say><Dial timeout="20" answerOnBridge="true"><Client><Identity>owner</Identity></Client></Dial></Response>')
   assert.equal(el('Hangup'), '<Hangup/>')
   assert.equal(xmlEscape('\u0001ok'), 'ok')
 })
@@ -60,7 +60,7 @@ t('E.164 normalisation', () => {
   assert.equal(toE164('06 1234 5678', '+39'), '+390612345678')
   assert.equal(toE164('694 123 4567'), null)
   assert.equal(toE164('hello'), null)
-  assert.equal(toE164('client:luca'), 'client:luca')
+  assert.equal(toE164('client:owner'), 'client:owner')
 })
 
 t('SMS segment counting', () => {

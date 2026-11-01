@@ -140,6 +140,18 @@ export class TwilioRest {
   createCall(form) { return this.request('POST', '/Calls.json', form) }
   updateCall(sid, form) { return this.request('POST', '/Calls/' + encodeURIComponent(sid) + '.json', form) }
   call(sid) { return this.request('GET', '/Calls/' + encodeURIComponent(sid) + '.json') }
+  // SIP Domains, credential lists and their auth mappings (the relay bridge).
+  sipDomains() { return this.request('GET', '/SIP/Domains.json?PageSize=100') }
+  createSipDomain(form) { return this.request('POST', '/SIP/Domains.json', form) }
+  updateSipDomain(sid, form) { return this.request('POST', '/SIP/Domains/' + encodeURIComponent(sid) + '.json', form) }
+  credentialLists() { return this.request('GET', '/SIP/CredentialLists.json?PageSize=100') }
+  createCredentialList(friendlyName) { return this.request('POST', '/SIP/CredentialLists.json', { FriendlyName: friendlyName }) }
+  credentials(listSid) { return this.request('GET', '/SIP/CredentialLists/' + encodeURIComponent(listSid) + '/Credentials.json?PageSize=100') }
+  createCredential(listSid, username, password) { return this.request('POST', '/SIP/CredentialLists/' + encodeURIComponent(listSid) + '/Credentials.json', { Username: username, Password: password }) }
+  updateCredential(listSid, sid, password) { return this.request('POST', '/SIP/CredentialLists/' + encodeURIComponent(listSid) + '/Credentials/' + encodeURIComponent(sid) + '.json', { Password: password }) }
+  /** kind: 'Calls' or 'Registrations'. */
+  domainCredentialMappings(domainSid, kind) { return this.request('GET', '/SIP/Domains/' + encodeURIComponent(domainSid) + '/Auth/' + kind + '/CredentialListMappings.json') }
+  mapCredentialList(domainSid, kind, listSid) { return this.request('POST', '/SIP/Domains/' + encodeURIComponent(domainSid) + '/Auth/' + kind + '/CredentialListMappings.json', { CredentialListSid: listSid }) }
   deleteRecording(sid) { return this.request('DELETE', '/Recordings/' + encodeURIComponent(sid) + '.json').catch(e => { if (e.status === 404) return null; throw e }) }
 
   /** Download a recording or media URL that lives under this account. */
@@ -164,7 +176,7 @@ export function xmlEscape(s) {
 }
 
 /**
- * el('Dial', { timeout: 20 }, [el('Client', {}, [el('Identity', {}, 'luca')])])
+ * el('Dial', { timeout: 20 }, [el('Client', {}, [el('Identity', {}, 'owner')])])
  * A string child is TEXT (escaped); an array child is MARKUP built by el().
  */
 export function el(name, attrs = {}, children) {
