@@ -28,13 +28,13 @@ import { runInNewContext } from 'node:vm'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const root = resolve(__dirname, '..')
 const outfile = join(root, 'lib', 'client.js')
-const ID = 'dsh-phone'
+const ID = '@lucagiftzek/dsh-phone'
 
 mkdirSync(join(root, 'lib'), { recursive: true })
 
 const banner = [
   "window.__ModuleLoader__.load({",
-  "  id: 'dsh-phone',",
+  "  id: '@lucagiftzek/dsh-phone',",
   "  factory: function (require) {",
   "    var module = { exports: {} };",
   "    var exports = module.exports;",

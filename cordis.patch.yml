@@ -6,4 +6,4 @@
 # webhook daemon) is a separate systemd unit and keeps answering calls.
 - insert:
     - id: dsh-phone
-      name: 'dsh-phone'
+      name: '@lucagiftzek/dsh-phone'

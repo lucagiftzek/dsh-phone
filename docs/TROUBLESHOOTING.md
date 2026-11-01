@@ -411,7 +411,7 @@ dsh --profile web --dump-config 2>/dev/null | grep -n -i 'dsh-phone' | head    #
 journalctl -u <your-dsh-unit> --since "1 hour ago" | grep -i -E 'dsh-phone|incompatible|skipped|exemption|duplicate loader entry|declares no dsh.bundle' | tail -40
 ```
 
-**Fix:** install with `dsh plugin --profile web add dsh-phone` (it adds the package to
+**Fix:** install with `dsh plugin --profile web add @lucagiftzek/dsh-phone` (it adds the package to
 `dsh.profile.bundles` when the package declares `dsh.bundle`; override values with a plain
 `- id: dsh-phone` row, never a second `insert` row), then restart
 `dsh web` **[HUMAN if your chat runs inside dsh web]**. If the log says the bundle
@@ -508,7 +508,7 @@ GB on a large profile; with swap full, the kernel or earlyoom kills unrelated se
 
 **Fix:** check `free -m` first, then install inside a memory-capped scope:
 ```bash
-systemd-run --user --scope -p MemoryMax=3G dsh plugin --profile web add dsh-phone
+systemd-run --user --scope -p MemoryMax=3G dsh plugin --profile web add @lucagiftzek/dsh-phone
 # pnpm only: add --child-concurrency 1 to reduce peak memory
 ```
 A runaway then kills only itself. Check afterwards that your other services are up.

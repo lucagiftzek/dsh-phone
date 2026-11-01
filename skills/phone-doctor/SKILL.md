@@ -17,7 +17,7 @@ Two processes: the **plugin** (inside `dsh web`, routes under `/dsh-phone/api/`)
 
 ## 0. Facts (read-only)
 Placeholders: `<dsh-url>` (for example `http://127.0.0.1:3080`), `<public-base-url>` (the `publicBaseUrl` setting). Run on the DSH machine.
-1. Plugin dir and docs: `node -p "require('path').dirname(require.resolve('dsh-phone/package.json',{paths:[(process.env.DSH_HOME||require('os').homedir()+'/.dsh')+'/profiles/web']}))"` then read `docs/TROUBLESHOOTING.md` and `docs/ERRORS.md` there.
+1. Plugin dir and docs: `node -p "require('path').dirname(require.resolve('@lucagiftzek/dsh-phone/package.json',{paths:[(process.env.DSH_HOME||require('os').homedir()+'/.dsh')+'/profiles/web']}))"` then read `docs/TROUBLESHOOTING.md` and `docs/ERRORS.md` there.
 2. Doctor (one call): `curl -s <dsh-url>/dsh-phone/api/doctor`; read `status` and every check that is not `ok` or `skip`.
 3. Plugin loaded and settings store: `curl -s <dsh-url>/dsh-phone/api/settings` (look at `version`, `store`; do not paste `settings`).
 4. State, setup issues, relay: `curl -s <dsh-url>/dsh-phone/api/state` and print only `ready`, `issues`, `mode`, `browserOnline`, `relay`, `sipAccounts[].issues` (the full body is safe but long; credentials show only `set` and `source`).

@@ -1,10 +1,15 @@
 # dsh-phone
 
+[![npm](https://img.shields.io/npm/v/%40lucagiftzek%2Fdsh-phone?label=npm)](https://www.npmjs.com/package/@lucagiftzek/dsh-phone)
+
 SMS, calls, live voicemail and Telegram in the DSH sidebar, with call audio through your own server.
+
+Install from npm: `dsh plugin --profile web add @lucagiftzek/dsh-phone`, or from GitHub: `dsh plugin --profile web add github:lucagiftzek/dsh-phone`.
 
 ```bash
 dsh plugin --profile web add dsh-better-sidebar   # the tab host, skip if installed
-dsh plugin --profile web add github:lucagiftzek/dsh-phone
+dsh plugin --profile web add @lucagiftzek/dsh-phone
+# or from GitHub: dsh plugin --profile web add github:lucagiftzek/dsh-phone
 # restart dsh web, then run phone-hookd and connect your provider (see Install)
 ```
 
@@ -64,7 +69,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now dsh-phone-hookd
 dsh plugin --profile web add link:$PWD   # then restart dsh web
 ```
 
-Plugin only (the Phone tab and agent tools, when the daemon runs elsewhere): `dsh plugin --profile web add github:lucagiftzek/dsh-phone`. The package declares `dsh.bundle`, so `dsh plugin add` lists it in the profile bundles.
+Plugin only (the Phone tab and agent tools, when the daemon runs elsewhere): from npm `dsh plugin --profile web add @lucagiftzek/dsh-phone`, or from GitHub `dsh plugin --profile web add github:lucagiftzek/dsh-phone`. The package declares `dsh.bundle`, so `dsh plugin add` lists it in the profile bundles.
 
 Then open **Settings > Phone**: put the account SID and auth token in the fields or in a `KEY=value` credentials file (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`; default `~/.config/twilio/credentials`), add your number as a line (or pick it from "Numbers on the Twilio account"), set the public webhook base URL, **Save**, then **Apply to Twilio**. The checklist should go green, and the browser registers so calls can ring.
 
