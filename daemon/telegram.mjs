@@ -89,6 +89,17 @@ export function maskCodes(text) {
     .replace(/(?<![\w/.])(?=[A-Za-z0-9_-]{6,24}(?![\w]))(?=[A-Za-z_-]*\d)(?=[0-9_-]*[A-Za-z])[A-Za-z0-9_-]{6,24}(?![\w])/g, '[code hidden]')
 }
 
+/** JSON from telegramd, with the 64-bit album id ("group") kept as its exact decimal digits. */
+export function parseTg(text) {
+  return JSON.parse(text, (k, v, ctx) => (k === 'group' && typeof v === 'number' && ctx && typeof ctx.source === 'string') ? ctx.source : v)
+}
+
+/** Album id for the INTEGER column: a decimal string (exact), or 0 when absent or malformed. */
+export function groupId(g) {
+  const s = String(g ?? '').trim()
+  return /^-?[1-9]\d{0,18}$/.test(s) ? s : 0
+}
+
 export function kindOf(id) {
   id = Number(id)
   if (id > 0) return 'user'
@@ -134,7 +145,7 @@ export function createTelegram(d) {
         res.on('data', c => chunks.push(c))
         res.on('end', () => {
           let json
-          try { json = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { json = { ok: false, code: 'TELEGRAM_INTERNAL', error: 'telegramd answered something that is not JSON' } }
+          try { json = parseTg(Buffer.concat(chunks).toString('utf8') || '{}') } catch { json = { ok: false, code: 'TELEGRAM_INTERNAL', error: 'telegramd answered something that is not JSON' } }
           if (res.statusCode >= 400 || json.ok === false) {
             const e = new Error(json.error || ('telegramd HTTP ' + res.statusCode))
             e.status = res.statusCode; e.body = { ok: false, code: json.code || 'TELEGRAM_INTERNAL', error: json.error || e.message, ...(json.retryAfter ? { retryAfter: json.retryAfter } : {}), ...(json.telegram ? { telegram: json.telegram } : {}) }
@@ -154,6 +165,12 @@ export function createTelegram(d) {
   }
 
   // ---------------------------------------------------------------- database
+
+  // Telegram album ids (grouped_id) are 64-bit and often above 2^53: they travel as
+  // decimal strings (exact digits from the JSON source text), are stored as SQLite
+  // integers (INTEGER affinity keeps them exact) and are always read back as TEXT,
+  // because node:sqlite refuses to return an integer JavaScript cannot represent.
+  const MSG_COLS = 'chat, id, ts, out, sender, sender_name, text, reply_to, fwd, edit, views, service, CAST(grp AS TEXT) AS grp, media, links, deleted, origin'
 
   const upChat = db.prepare(`INSERT INTO tg_chats (id, kind, title, username, flags, updated) VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE tg_chats.title END,
@@ -179,7 +196,7 @@ export function createTelegram(d) {
     upMsg.run({
       chat: Number(m.chat), id: Number(m.id), ts: Number(m.date || 0), out: m.out ? 1 : 0, sender: Number(m.from || 0), sender_name: String(m.fromName || ''),
       text: String(m.text || ''), reply_to: Number(m.replyTo || 0), fwd: String(m.fwd || ''), edit: Number(m.edit || 0), views: Number(m.views || 0),
-      service: String(m.service || ''), grp: Number(m.group || 0), media: m.media ? JSON.stringify(m.media) : '', links: m.links && m.links.length ? JSON.stringify(m.links) : '', origin: origin || '',
+      service: String(m.service || ''), grp: groupId(m.group), media: m.media ? JSON.stringify(m.media) : '', links: m.links && m.links.length ? JSON.stringify(m.links) : '', origin: origin || '',
     })
     setLast.run(Number(m.date || 0), Number(m.id), previewOf(m).slice(0, 200), m.out ? 1 : 0, Number(m.chat), Number(m.id), Number(m.date || 0))
     return true
@@ -207,7 +224,7 @@ export function createTelegram(d) {
     if (r.edit) m.edit = r.edit
     if (r.views) m.views = r.views
     if (r.service) m.service = r.service
-    if (r.grp) m.group = r.grp
+    if (r.grp && r.grp !== '0') m.group = String(r.grp)
     if (r.media) { try { m.media = JSON.parse(r.media) } catch {} }
     if (r.links) { try { m.links = JSON.parse(r.links) } catch {} }
     if (r.deleted) m.deleted = true
@@ -229,8 +246,8 @@ export function createTelegram(d) {
 
   function messages(chatId, { before = 0, limit = 50 } = {}) {
     const rows = before
-      ? db.prepare('SELECT * FROM tg_messages WHERE chat=? AND id<? ORDER BY id DESC LIMIT ?').all(Number(chatId), Number(before), limit)
-      : db.prepare('SELECT * FROM tg_messages WHERE chat=? ORDER BY id DESC LIMIT ?').all(Number(chatId), limit)
+      ? db.prepare(`SELECT ${MSG_COLS} FROM tg_messages WHERE chat=? AND id<? ORDER BY id DESC LIMIT ?`).all(Number(chatId), Number(before), limit)
+      : db.prepare(`SELECT ${MSG_COLS} FROM tg_messages WHERE chat=? ORDER BY id DESC LIMIT ?`).all(Number(chatId), limit)
     return rows.reverse().map(msgRow)
   }
 
@@ -294,7 +311,7 @@ export function createTelegram(d) {
         const known = db.prepare('SELECT 1 FROM tg_messages WHERE chat=? AND id=?').get(Number(m.chat), Number(m.id))
         saveMessage(m, data.origin || '')
         if (ev.type === 'message' && !known && !m.out && !m.service) db.prepare('UPDATE tg_chats SET unread=unread+1 WHERE id=?').run(Number(m.chat))
-        const saved = msgRow(db.prepare('SELECT * FROM tg_messages WHERE chat=? AND id=?').get(Number(m.chat), Number(m.id)))
+        const saved = msgRow(db.prepare(`SELECT ${MSG_COLS} FROM tg_messages WHERE chat=? AND id=?`).get(Number(m.chat), Number(m.id)))
         d.broadcast(ev.type === 'message' ? 'tg.message' : 'tg.edit', { message: saved, chat: chat(m.chat), isNew: !known, counts: counts() })
         if (ev.type === 'message') tx.onMessage(saved, !known)
         break
@@ -372,7 +389,7 @@ export function createTelegram(d) {
           const line = buf.slice(0, i); buf = buf.slice(i + 1)
           if (!line.trim()) continue
           let ev
-          try { ev = JSON.parse(line) } catch { continue }
+          try { ev = parseTg(line) } catch { continue }
           try { onEvent(ev) } catch (e) { d.warn('telegram: event ' + ev.type + ' failed:', e.message) }
         }
         if (buf.length > 4 << 20) buf = ''
@@ -449,7 +466,7 @@ export function createTelegram(d) {
     if (m && m.id) {
       const known = db.prepare('SELECT 1 FROM tg_messages WHERE chat=? AND id=?').get(Number(m.chat), Number(m.id))
       saveMessage(m, origin)
-      const saved = msgRow(db.prepare('SELECT * FROM tg_messages WHERE chat=? AND id=?').get(Number(m.chat), Number(m.id)))
+      const saved = msgRow(db.prepare(`SELECT ${MSG_COLS} FROM tg_messages WHERE chat=? AND id=?`).get(Number(m.chat), Number(m.id)))
       d.broadcast('tg.message', { message: saved, chat: chat(m.chat), isNew: true, counts: counts() })
       tx.onMessage(saved, !known)
     }
@@ -475,7 +492,7 @@ export function createTelegram(d) {
     })
   }
 
-  function msgOf(chatId, msgId) { return msgRow(db.prepare('SELECT * FROM tg_messages WHERE chat=? AND id=?').get(Number(chatId), Number(msgId))) }
+  function msgOf(chatId, msgId) { return msgRow(db.prepare(`SELECT ${MSG_COLS} FROM tg_messages WHERE chat=? AND id=?`).get(Number(chatId), Number(msgId))) }
 
   // ---------------------------------------------------------------- calls
 

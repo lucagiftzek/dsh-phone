@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 (2026-11-05)
+
+- **Fix: Telegram chats with a photo album no longer fail to open.** Telegram album ids (grouped_id) are 64-bit and often above 2^53, and node:sqlite refused to read them back ("Value is too large to be represented as a JavaScript number"). The id is now kept as its exact decimal digits end to end (parsed from the JSON source text, stored as a decimal string, always read back with CAST(... AS TEXT)). Existing rows keep working.
+
 ## 0.3.1 (2026-11-02)
 
 - **Fix: white text on a white button in dark mode.** On a stock DSH theme in dark mode the host primary colour is near white, but the Send and other primary buttons, the outgoing SMS bubble and the unread badges had hard-coded white text. They now use the host's paired foreground token (`--dsw-alias-label-primary-foreground`, white as the fallback), so they read in light and dark and with custom themes; a muted Telegram badge uses the background colour on its grey.

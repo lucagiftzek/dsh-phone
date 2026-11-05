@@ -15,7 +15,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { violations } from './lossless-check.mjs'
-import { previewOf, kindOf, maskCodes } from '../daemon/telegram.mjs'
+import { previewOf, kindOf, maskCodes, parseTg, groupId } from '../daemon/telegram.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 let passed = 0
@@ -238,6 +238,25 @@ await t('resolve: ui allowed, agent refused by telegramd policy', async () => {
   assert.equal(no.status, 403); assert.equal(no.body.code, 'TELEGRAM_CHAT_NOT_ALLOWED')
   const nr = await priv('/tg/nope')
   assert.equal(nr.status, 404); assert.equal(nr.body.code, 'TELEGRAM_NOT_FOUND')
+})
+
+await t('album id above 2^53 stays exact and reading the chat does not throw', async () => {
+  const GID = '14350891792988188'
+  assert.ok(Number(GID) > Number.MAX_SAFE_INTEGER)
+  assert.equal(parseTg('{"a":1,"group":' + GID + '}').group, GID, 'exact digits from the JSON source')
+  assert.equal(parseTg('{"group":0}').group, '0')
+  assert.equal(groupId(GID), GID); assert.equal(groupId(undefined), 0); assert.equal(groupId('abc'), 0)
+  // raw JSON line: JSON.stringify would round the number, so write the digits by hand
+  const raw = '{"seq":' + (++fake.seq) + ',"type":"message","at":1,"data":{"chat":{"id":42,"kind":"user","title":"Alice"},"message":{"chat":42,"id":31,"date":1700000500,"out":true,"text":"album","group":' + GID + ',"media":{"kind":"photo"}}}}\n'
+  for (const s of fake.streams) s.write(raw)
+  assert.ok(await until(async () => (await priv('/tg/messages?chat=42&local=1')).body.messages.some(m => m.id === 31)))
+  const r = await priv('/tg/messages?chat=42&local=1')
+  assert.equal(r.status, 200)
+  assert.equal(r.body.messages.find(m => m.id === 31).group, GID)
+  assert.equal(r.body.messages.find(m => m.id === 10).group, undefined, 'no album: no group field')
+  const open = await priv('/tg/messages?chat=42')
+  assert.equal(open.status, 200)
+  assert.equal(open.body.messages.find(m => m.id === 31).group, GID)
 })
 
 await t('telegramd down: status says so, calls answer TELEGRAM_DAEMON_UNAVAILABLE, stream reconnects', async () => {
